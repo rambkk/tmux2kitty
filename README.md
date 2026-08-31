@@ -20,6 +20,7 @@ Turn tmux windows into native Kitty tabs.
 ## Prerequisites
 
 Make sure you have the following installed on your machine:
+- **Operating System:** Tested and working on **Ubuntu 26.04 Linux** (compatible with other Linux distributions supporting Bash, Kitty, and tmux).
 - **[Kitty](https://sw.kovidgoyal.net/kitty/)** terminal emulator (version with remote control support)
 - **`tmux`** installed both locally and on your remote target (if using remote mode)
 - **Python 3** (used internally for precise tab sorting/matching)
