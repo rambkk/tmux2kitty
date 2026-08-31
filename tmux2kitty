@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Ram Narula github.com/rambkk
+# Licensed under the MIT license.
+# (See the LICENSE file for the whole license text.)
+#
+
+set -u
+umask 0077
+
+# ============================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================
+
+usage() {
+    echo "Usage: $0 <remote|local> [-t 'session name']"
+    echo
+    echo "Arguments:"
+    echo "  <remote|local>       Remote SSH host, or 'local'"
+    echo "  -t 'session name'    Optional tmux session name"
+    echo
+    echo "Examples:"
+    echo "  $0 user@server"
+    echo "  $0 user@server -t mysession"
+    echo "  $0 local"
+    echo "  $0 local -t mysession"
+}
+
+# Exactly 1 argument: remote/local, prompt for session
+# Exactly 3 arguments: remote/local -t session, don't prompt
+
+if [[ $# -eq 1 ]]; then
+    REMOTE="$1"
+    SESSION=""
+elif [[ $# -eq 3 ]]; then
+    REMOTE="$1"
+
+    if [[ "$2" != "-t" || -z "$3" ]]; then
+        usage
+        exit 1
+    fi
+
+    SESSION="$3"
+else
+    usage
+    exit 1
+fi
+
+
+
+
+if [[ "$REMOTE" == "local" ]]; then
+    LOCAL=1
+else
+    LOCAL=0
+fi
+
+
+# Per-session runtime directory
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/tmux-kitty}"
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+KITTY_SOCKET=""
+WORKDIR=""
+
+
+# SSH multiplexing socket
+SSH_CONTROL="$HOME/.ssh/control-%C"
+
+RECONNECT_DELAY=2
+POLL_INTERVAL=1
+
+
+# ============================================================
+# SSH OPTIONS
+# ============================================================
+
+SSH_OPTS=(
+    -o ControlMaster=auto
+    -o ControlPath="$SSH_CONTROL"
+    -o ControlPersist=10m
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ConnectTimeout=10
+)
+
+
+# ============================================================
+# TRAP CLEANUP
+# ============================================================
+
+cleanup() {
+    [[ -n "${SESSION_DIR:-}" ]] && rm -rf -- "$SESSION_DIR"
+}
+trap cleanup EXIT
+
+
+# ============================================================
+# SSH CONTROL CHANNEL FUNCTIONS
+# ============================================================
+
+ssh_master_alive()
+{
+[ "${LOCAL:-0}" -eq 1 ] && return 0
+    ssh "${SSH_OPTS[@]}" \
+        -O check \
+        "$REMOTE" \
+        >/dev/null 2>&1
+}
+
+check_ssh_socket() {
+[ "${LOCAL:-0}" -eq 1 ] && return 0
+
+SSH_HOST=$1
+
+SOCKET_PATH=$(ssh -G -o "ControlPath=$SSH_CONTROL" "$SSH_HOST" | awk '/^controlpath / {print $2}')
+
+# Check if the file exists AND the connection test fails
+if [ -S "$SOCKET_PATH" ] && ! ssh -O check "$SSH_HOST" 2>/dev/null; then
+    echo "⚠️ Stale SSH session detected (file exists but not working)! Fixing..."
+    rm -f "$SOCKET_PATH"
+fi
+
+}
+
+start_ssh_master()
+{
+[ "${LOCAL:-0}" -eq 1 ] && return 0
+    echo "Connecting to $REMOTE..."
+
+    ssh "${SSH_OPTS[@]}" \
+        -O exit \
+        "$REMOTE" \
+        >/dev/null 2>&1 || true
+
+    check_ssh_socket "$REMOTE"
+
+    ssh "${SSH_OPTS[@]}" \
+        -MN \
+        "$REMOTE" &
+
+    SSH_MASTER_PID=$!
+
+    for _ in {1..50}; do
+        if ssh_master_alive; then
+            echo "SSH master connected."
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    echo "ERROR: unable to establish SSH master."
+    kill "$SSH_MASTER_PID" 2>/dev/null || true
+    return 1
+}
+
+init_ssh_control()
+{
+    if ssh_master_alive; then
+        return 0
+    fi
+
+    while ! start_ssh_master; do
+        echo "Retrying SSH in ${RECONNECT_DELAY}s..."
+        sleep "$RECONNECT_DELAY"
+    done
+}
+
+ssh_remote()
+{
+    if [ "${LOCAL:-0}" -eq 1 ]; then
+echo running $1
+	eval "$1"
+    else
+        ssh "${SSH_OPTS[@]}" "$REMOTE" "$1"
+    fi
+}
+
+
+# ============================================================
+# SESSION SELECTION MENU
+# ============================================================
+
+select_or_create_session()
+{
+    echo "=========================================="
+    echo " TMUX REMOTE GUI LAUNCHER"
+    echo "=========================================="
+    
+    echo "Active remote sessions on $REMOTE:"
+    if ! ssh_remote "tmux ls" >/dev/null 2>&1; then
+        echo "  (No active tmux sessions found)"
+    else
+        ssh_remote "tmux list-sessions -F '#{session_name}'" | grep -v '__' | while read -r s; do
+            echo "  📦 Session: $s"
+            ssh_remote "tmux list-windows -t '$s' -F '     ↳ Index #{window_index}: #{window_name}'" 2>/dev/null
+        done
+    fi
+    echo "------------------------------------------"
+
+    local base_name="tmux-kitty"
+    local default_session="${base_name}"
+    
+
+if [[ -z "$SESSION" ]]; then
+    read -p "Enter session name to connect or create [$default_session]: " input_session
+    SESSION="${input_session:-$default_session}"
+else
+    echo "Using session: $SESSION"
+fi
+    
+    SESSION_DIR="$RUNTIME_DIR/$SESSION"
+    WORKDIR="$SESSION_DIR/work"
+
+    mkdir -p "$WORKDIR"
+    chmod 700 "$SESSION_DIR" "$WORKDIR"
+    
+    KITTY_SOCKET="$SESSION_DIR/kitty.sock"
+
+
+    if ! ssh_remote "tmux has-session -t '=${SESSION}'" >/dev/null 2>&1; then
+        echo "Session '$SESSION' does not exist. Creating it now..."
+        ssh_remote "tmux new-session -d -s '${SESSION}'"
+        sleep 1
+    else
+        echo "Connecting to existing session: $SESSION"
+    fi
+    echo
+}
+
+
+# ============================================================
+# KITTY CONNECTION FUNCTIONS
+# ============================================================
+
+init_kitty()
+{
+    rm -f "$KITTY_SOCKET"
+
+    echo "Starting Kitty terminal..."
+    kitty \
+        -o allow_remote_control=yes \
+        -o remember_window_size=no \
+        -o initial_window_width=100c \
+        -o initial_window_height=24c \
+        -o scrollback_pager="less --chop-long-lines --RAW-CONTROL-CHARS +INPUT_LINE_NUMBER" \
+        -o mouse_map="wheel_up ungrabbed scroll_line_up" \
+        -o mouse_map="wheel_down ungrabbed scroll_line_down" \
+        -o tab_title_template="{title}" \
+        -o dynamic_title=yes \
+        --listen-on "unix:${KITTY_SOCKET}" &
+
+    KITTY_PID=$!
+
+    for _ in {1..100}; do
+        if [[ -S "$KITTY_SOCKET" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "ERROR: kitty socket did not appear."
+    return 1
+}
+
+kitty_cmd()
+{
+    kitty @ \
+        --to "unix:${KITTY_SOCKET}" \
+        "$@"
+}
+
+
+# ============================================================
+# MAIN EXECUTION FLOW
+# ============================================================
+
+main()
+{
+    # 1. Initialize SSH multiplexing control channel first
+    init_ssh_control
+
+    # 2. Present startup session menu
+    select_or_create_session
+
+    rm -rf "$WORKDIR"
+    mkdir -p "$WORKDIR"
+
+    # 3. Purge stale remote tab sessions from previous runs for this session safely
+    echo "Purging stale remote tab sessions..."
+    ssh_remote "tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${SESSION}__' | xargs -r -I {} tmux kill-session -t '{}'" || true
+
+    # 4. Initialize local Kitty terminal instance
+    init_kitty || exit 1
+
+    # 5. Create tab runner script
+    RUNNER="$WORKDIR/remote-tmux-tab.sh"
+
+    cat > "$RUNNER" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+if [[ "$1" == "local" ]]; then
+    LOCAL=1
+else
+    LOCAL=0
+fi
+
+REMOTE="$1"
+SESSION="$2"
+WINDOW_ID="$3"
+
+SSH_CONTROL="$HOME/.ssh/control-%C"
+RECONNECT_DELAY=2
+
+SSH_OPTS=(
+    -o ControlMaster=auto
+    -o ControlPath="$SSH_CONTROL"
+    -o ControlPersist=10m
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ConnectTimeout=10
+)
+
+ssh_master_alive()
+{
+[ "${LOCAL:-0}" -eq 1 ] && return 0
+    ssh "${SSH_OPTS[@]}" -O check "$REMOTE" >/dev/null 2>&1
+}
+
+SAFE_WID=$(echo "$WINDOW_ID" | tr '@%' '_')
+TAB_SESSION="${SESSION}__${SAFE_WID}"
+
+cleanup_tab() {
+    if [[ -n "${KITTY_WINDOW_ID:-}" && -n "${KITTY_SOCKET:-}" ]]; then
+        kitty @ --to "unix:${KITTY_SOCKET}" close-tab --match "id:${KITTY_WINDOW_ID}" 2>/dev/null || true
+    fi
+}
+trap cleanup_tab EXIT
+
+while true; do
+    while ! ssh_master_alive; do
+        sleep "$RECONNECT_DELAY"
+    done
+
+    # Ensure an isolated session exists, link the window, disable mouse/alternate-screen, and set term-overrides
+TMUX_SETUP="if ! tmux has-session -t '=${TAB_SESSION}' 2>/dev/null; then
+            tmux new-session -d -s '${TAB_SESSION}'
+            tmux link-window -s '${SESSION}:${WINDOW_ID}' -t '${TAB_SESSION}:' 2>/dev/null || true
+            tmux kill-window -t '${TAB_SESSION}:0' 2>/dev/null || true
+            tmux set-option -t '${TAB_SESSION}' mouse off
+            tmux set-option -t '${TAB_SESSION}' alternate-screen off
+            tmux set-option status off
+            tmux set-option -ga terminal-overrides ',xterm*:smcup@:rmcup@'
+        fi" > /dev/null 2>&1
+TMUX_ATTACH_TAB="TERM=xterm-256color tmux attach-session -t '${TAB_SESSION}'"
+if [ "${LOCAL:-0}" -eq 1 ]; then
+	eval "$TMUX_SETUP" > /dev/null 2>&1
+	eval "$TMUX_ATTACH_TAB"
+else
+    ssh "${SSH_OPTS[@]}" "$REMOTE" "$TMUX_SETUP" > /dev/null 2>&1
+    ssh "${SSH_OPTS[@]}" -t "$REMOTE" "$TMUX_ATTACH_TAB"
+fi
+RET=$?
+    if [[ $RET -eq 0 ]]; then
+    	exit 0
+    fi
+
+    sleep "$RECONNECT_DELAY"
+done
+EOF
+
+    chmod +x "$RUNNER"
+cp $RUNNER /tmp/xx
+
+    declare -A KNOWN_WINDOWS
+
+    echo
+    echo "=========================================="
+    echo " Remote tmux GUI started (Native Scrolling)"
+    echo "=========================================="
+    echo "Remote : $REMOTE"
+    echo "Session: $SESSION"
+    echo "Kitty  : $KITTY_PID"
+    echo
+
+    # 6. Continuous monitoring loop
+    while true; do
+        ssh_remote "
+            for s in \$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${SESSION}__'); do
+                for wid in \$(tmux list-windows -t \"\$s\" -F '#{window_id}' 2>/dev/null); do
+                    if ! tmux list-windows -t '=${SESSION}' -F '#{window_id}' 2>/dev/null | grep -q \"\$wid\"; then
+                        tmux move-window -s \"\$s:\$wid\" -t '=${SESSION}:' 2>/dev/null || true
+                    fi
+                done
+            done
+        " >/dev/null 2>&1
+
+        WINDOW_LIST_COMMAND="tmux list-windows -t '=${SESSION}' -F '#{window_id}|#{window_index}|#{window_name}'"
+        
+        if mapfile -t WINDOWS < <(ssh_remote "$WINDOW_LIST_COMMAND" 2>/dev/null); then
+            declare -A CURRENT_ACTIVE_IDS
+            for ENTRY in "${WINDOWS[@]}"; do
+                IFS='|' read -r WINDOW_ID INDEX NAME <<< "$ENTRY"
+                CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
+
+                if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
+                    echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
+                    kitty_cmd launch \
+                        --type=tab \
+                        --tab-title "$INDEX" \
+                        --title "$INDEX" \
+                        bash -c "printf '\033]2;%s\007' '$INDEX'; exec '$RUNNER' '$REMOTE' '$SESSION' '$WINDOW_ID'" \
+                        >/dev/null
+
+                    KNOWN_WINDOWS[$WINDOW_ID]=1
+                    sleep 0.8  # Allow tab to initialize fully
+
+                    # ONLY execute movement/sorting calculation right after launching a new tab
+                    python3 -c '
+import sys, json, subprocess
+socket_path = sys.argv[1]
+for _ in range(3): # Retry a couple times to ensure the new tab is fully registered in ls output
+    res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
+    if res.returncode != 0:
+        break
+    try:
+        data = json.loads(res.stdout)
+        tabs = data[0].get("tabs", [])
+        tab_tuples = []
+        for tab in tabs:
+            title = str(tab.get("title", "")).strip()
+            tab_id = str(tab.get("id"))
+            if title.isdigit():
+                tab_tuples.append((int(title), tab_id))
+        
+        if tab_tuples:
+            sorted_tuples = sorted(tab_tuples, key=lambda x: x[0])
+            titles = [t[0] for t in tab_tuples]
+            if titles != sorted(titles):
+                for target_idx, (val, tid) in enumerate(sorted_tuples):
+                    curr_res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
+                    if curr_res.returncode != 0:
+                        break
+                    curr_tabs = json.loads(curr_res.stdout)[0].get("tabs", [])
+                    curr_tuples = [(int(str(t.get("title","0")).strip()), str(t.get("id"))) for t in curr_tabs if str(t.get("title","0")).strip().isdigit()]
+                    try:
+                        curr_idx = [t[1] for t in curr_tuples].index(tid)
+                    except ValueError:
+                        continue
+                    if curr_idx != target_idx:
+                        subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "focus-tab", "--match", f"id:{tid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        diff = target_idx - curr_idx
+                        action_cmd = "move_tab_forward" if diff > 0 else "move_tab_backward"
+                        for _ in range(abs(diff)):
+                            subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "action", action_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+    except Exception:
+        pass
+' "$KITTY_SOCKET" 2>/dev/null
+                fi
+            done
+
+            for WID in "${!KNOWN_WINDOWS[@]}"; do
+                if [[ -z "${CURRENT_ACTIVE_IDS[$WID]:-}" ]]; then
+                    unset "KNOWN_WINDOWS[$WID]"
+                fi
+            done
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+main "$@"
