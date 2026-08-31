@@ -170,7 +170,6 @@ init_ssh_control()
 ssh_remote()
 {
     if [ "${LOCAL:-0}" -eq 1 ]; then
-echo running $1
 	eval "$1"
     else
         ssh "${SSH_OPTS[@]}" "$REMOTE" "$1"
