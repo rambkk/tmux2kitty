@@ -41,6 +41,11 @@ elif [[ $# -eq 3 ]]; then
     fi
 
     SESSION="$3"
+    if [[ ! "$SESSION" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
+	echo "Invalid session name. Allowed characters: letters, numbers, underscores, dots, and hyphens. Maximum length is 32 bytes." >&2
+	exit 1
+    fi
+
 else
     usage
     exit 1
@@ -58,8 +63,8 @@ fi
 
 # Per-session runtime directory
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/tmux-kitty}"
-mkdir -p "$RUNTIME_DIR"
-chmod 700 "$RUNTIME_DIR"
+mkdir -p -- "$RUNTIME_DIR"
+chmod 700 -- "$RUNTIME_DIR"
 
 KITTY_SOCKET=""
 WORKDIR=""
@@ -102,22 +107,22 @@ trap cleanup EXIT
 
 ssh_master_alive()
 {
-[ "${LOCAL:-0}" -eq 1 ] && return 0
+    [ "${LOCAL:-0}" -eq 1 ] && return 0
     ssh "${SSH_OPTS[@]}" -O check "$REMOTE"  >/dev/null 2>&1
 }
 
 check_ssh_socket()
 {
-[ "${LOCAL:-0}" -eq 1 ] && return 0
+	[ "${LOCAL:-0}" -eq 1 ] && return 0
 
-SSH_HOST="$1"
-SOCKET_PATH=$(ssh ${SSH_OPTS[@]} -G "$SSH_HOST" | awk '/^controlpath / {print $2}')
+	SSH_HOST="$1"
+	SOCKET_PATH=$(ssh ${SSH_OPTS[@]} -G "$SSH_HOST" | awk '/^controlpath / {print $2}')
 
-# Check if the file exists AND the connection test fails
-if [ -S "$SOCKET_PATH" ] && ! ssh "${SSH_OPTS[@]}" -O check "$SSH_HOST" 2>/dev/null; then
-    echo "⚠️ Stale SSH session detected! Fixing..."
-    rm -f -- "$SOCKET_PATH"
-fi
+	# Check if the file exists AND the connection test fails
+	if [ -S "$SOCKET_PATH" ] && ! ssh "${SSH_OPTS[@]}" -O check "$SSH_HOST" 2>/dev/null; then
+	    echo "⚠️ Stale SSH session detected! Fixing..."
+	    rm -f -- "$SOCKET_PATH"
+	fi
 
 }
 
@@ -163,7 +168,7 @@ ssh_remote()
     if [ "${LOCAL:-0}" -eq 1 ]; then
 	eval "$1"
     else
-        ssh "${SSH_OPTS[@]}" "$REMOTE" "$1"
+        ssh "${SSH_OPTS[@]}" "$REMOTE" -- "$1"
     fi
 }
 
@@ -193,18 +198,27 @@ select_or_create_session()
     local default_session="${base_name}"
     
 
-if [[ -z "$SESSION" ]]; then
-    read -p "Enter session name to connect or create [$default_session]: " input_session
-    SESSION="${input_session:-$default_session}"
-else
-    echo "Using session: $SESSION"
-fi
-    
+	while true; do
+	    if [[ -z "$SESSION" ]]; then
+		read -p "Enter session name to connect or create [$default_session]: " input_session
+		SESSION="${input_session:-$default_session}"
+	    else
+		echo "Using session: $SESSION"
+	    fi
+
+	    if [[ "$SESSION" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
+		break
+	    fi
+
+	    echo "Invalid session name. Allowed characters: letters, numbers, underscores, dots, and hyphens. Maximum length is 32 bytes." >&2
+	    SESSION=""
+	done
+	    
     SESSION_DIR="$RUNTIME_DIR/$SESSION"
     WORKDIR="$SESSION_DIR/work"
 
-    mkdir -p "$WORKDIR"
-    chmod 700 "$SESSION_DIR" "$WORKDIR"
+    mkdir -p -- "$WORKDIR"
+    chmod 700 -- "$SESSION_DIR" "$WORKDIR"
     
     KITTY_SOCKET="$SESSION_DIR/kitty.sock"
 
@@ -226,7 +240,7 @@ fi
 
 init_kitty()
 {
-    rm -f "$KITTY_SOCKET"
+    rm -f -- "$KITTY_SOCKET"
 
     echo "Starting Kitty terminal..."
     kitty \
@@ -274,8 +288,8 @@ main()
     # 2. Present startup session menu
     select_or_create_session
 
-    rm -rf "$WORKDIR"
-    mkdir -p "$WORKDIR"
+    rm -rf -- "$WORKDIR"
+    mkdir -p -- "$WORKDIR"
 
     # 3. Purge stale remote tab sessions from previous runs for this session safely
     echo "Purging stale remote tab sessions..."
@@ -313,6 +327,15 @@ SSH_OPTS=(
     -o ConnectTimeout=10
 )
 
+ssh_remote()
+{
+    if [ "${LOCAL:-0}" -eq 1 ]; then
+	eval "$1"
+    else
+        ssh "${SSH_OPTS[@]}" "$REMOTE" -- "$1"
+    fi
+}
+
 ssh_master_alive()
 {
 [ "${LOCAL:-0}" -eq 1 ] && return 0
@@ -335,7 +358,8 @@ while true; do
     done
 
     # Ensure an isolated session exists, link the window, disable mouse/alternate-screen, and set term-overrides
-TMUX_SETUP="if ! tmux has-session -t '=${TAB_SESSION}' 2>/dev/null; then
+	ssh_remote "
+	if ! tmux has-session -t '=${TAB_SESSION}' 2>/dev/null; then
             tmux new-session -d -s '${TAB_SESSION}'
             tmux link-window -s '${SESSION}:${WINDOW_ID}' -t '${TAB_SESSION}:' 2>/dev/null || true
             tmux kill-window -t '${TAB_SESSION}:0' 2>/dev/null || true
@@ -344,25 +368,21 @@ TMUX_SETUP="if ! tmux has-session -t '=${TAB_SESSION}' 2>/dev/null; then
             tmux set-option status off
             tmux set-option -ga terminal-overrides ',xterm*:smcup@:rmcup@'
         fi" > /dev/null 2>&1
-TMUX_ATTACH_TAB="TERM=xterm-256color tmux attach-session -t '${TAB_SESSION}'"
-if [ "${LOCAL:-0}" -eq 1 ]; then
-	eval "$TMUX_SETUP" > /dev/null 2>&1
-	eval "$TMUX_ATTACH_TAB"
-else
-    ssh "${SSH_OPTS[@]}" "$REMOTE" "$TMUX_SETUP" > /dev/null 2>&1
-    ssh "${SSH_OPTS[@]}" -t "$REMOTE" "$TMUX_ATTACH_TAB"
-fi
-RET=$?
-    if [[ $RET -eq 0 ]]; then
-    	exit 0
-    fi
+
+	SSH_OPTS+=(-t)
+	ssh_remote "TERM=xterm-256color tmux attach-session -t '${TAB_SESSION}'"
+	unset 'SSH_OPTS[-1]'
+	RET=$?
+	if [[ $RET -eq 0 ]]; then
+		exit 0
+	fi
 
     sleep "$RECONNECT_DELAY"
 done
 EOF
 
     chmod +x "$RUNNER"
-cp $RUNNER /tmp/xx
+cp -- $RUNNER /tmp/xx
 
     declare -A KNOWN_WINDOWS
 
