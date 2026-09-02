@@ -11,8 +11,9 @@ Turn tmux windows into native Kitty tabs.
 
 - **Native Kitty Tabs:** Each tmux window gets its own dedicated, native Kitty tab.
 - **Remote & Local Support:** Works smoothly over SSH with resilient control masters or locally on your machine.
+- **Dynamic Tab Renaming:** Automatically syncs Kitty tab titles with your active tmux window names and indices (index-name).
 - **Auto-Syncing:** Automatically maps, sorts, and cleans up tabs to mirror your tmux window states.
-- **Zero Heavy Dependencies:** Written entirely in pure Bash with minimal requirements (`kitty`, `tmux`, and a Python helper for tab sorting).
+- **Zero Heavy Dependencies:** Written entirely in pure Bash with minimal requirements (`kitty`, `tmux`, `jq`, and a Python helper for tab sorting).
 - **Resilient Reconnections:** Handles network drops gracefully when running over remote SSH.
 
 ---------
@@ -23,6 +24,7 @@ Make sure you have the following installed on your machine:
 - **Operating System:** Tested and working on **Ubuntu 26.04 Linux** (compatible with other Linux distributions supporting Bash, Kitty, and tmux).
 - **[Kitty](https://sw.kovidgoyal.net/kitty/)** terminal emulator (version with remote control support)
 - **`tmux`** installed both locally and on your remote target (if using remote mode)
+- **`jq`** command-line JSON processor (used for tracking and updating tab titles)
 - **Python 3** (used internally for precise tab sorting/matching)
 
 ---------
