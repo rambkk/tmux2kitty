@@ -275,6 +275,121 @@ kitty_cmd()
         "$@"
 }
 
+kitty_create_tab()
+{
+    local index="$1"
+    local name="$2"
+    local runner="$3"
+    local remote="$4"
+    local session="$5"
+    local window_id="$6"
+
+                    kitty_cmd launch \
+                        --type=tab \
+                        --tab-title "$index-$name" \
+                        --title "$index-$name" \
+                        bash -c "printf '\033]2;%s\007' '$index'; exec '$runner' '$remote' '$session' '$window_id'" \
+                        >/dev/null
+
+                    KNOWN_WINDOWS[$WINDOW_ID]=1
+                    sleep 0.8  # Allow tab to initialize fully
+
+}
+
+kitty_sync_tab_title()
+{
+    local window_ref="$1"
+    local index="$2"
+    local name="$3"
+    
+    # Remove leading '@' if it exists (e.g., turn "@0" into "0")
+    CLEAN_REF="${window_ref#@}"
+
+    # 1. Determine the expected title
+    if [ -n "$NAME" ]; then
+        EXPECTED_TITLE="${index}-${name}"
+    else
+        EXPECTED_TITLE="${index}"
+    fi
+
+    # 2. Find the actual Kitty Tab ID by searching for the reference in the cmdline
+    # This checks if any command-line argument matches the reference (with or without '@')
+    TAB_ID=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$CLEAN_REF" '
+        .[].tabs[] 
+        | select(.windows[].cmdline[]? | . == $ref or . == "@" + $clean_ref) 
+        | .id
+    ' | head -n 1)
+
+    # 3. If a valid Tab ID was found, check and update its title
+    if [ -n "$TAB_ID" ]; then
+        CURRENT_TITLE=$(kitty_cmd ls | jq -r --arg id "$TAB_ID" '.[].tabs[] | select(.id|tostring == $id) | .title // empty')
+
+        if [ "$CURRENT_TITLE" != "$EXPECTED_TITLE" ]; then
+            kitty_cmd set-tab-title --match "id:$TAB_ID" "$EXPECTED_TITLE"
+        fi
+    fi
+}
+
+kitty_sort_tab()
+{
+   local kitty_socket="$1"
+
+   python3 -c '
+import sys, json, subprocess, re
+
+socket_path = sys.argv[1]
+for _ in range(3): # Retry a couple times to ensure the new tab is fully registered in ls output
+    res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
+    if res.returncode != 0:
+        break
+    try:
+        data = json.loads(res.stdout)
+        tabs = data[0].get("tabs", [])
+        tab_tuples = []
+        for tab in tabs:
+            title = str(tab.get("title", "")).strip()
+            tab_id = str(tab.get("id"))
+            
+            # Match either XXX or XXX-name (digits at the start, optional hyphen + text)
+            match = re.match(r"^(\d+)(?:-.*)?$", title)
+            if match:
+                tab_num = int(match.group(1))
+                tab_tuples.append((tab_num, tab_id))
+        
+        if tab_tuples:
+            sorted_tuples = sorted(tab_tuples, key=lambda x: x[0])
+            titles = [t[0] for t in tab_tuples]
+            if titles != sorted(titles):
+                for target_idx, (val, tid) in enumerate(sorted_tuples):
+                    curr_res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
+                    if curr_res.returncode != 0:
+                        break
+                    curr_tabs = json.loads(curr_res.stdout)[0].get("tabs", [])
+                    
+                    # Apply the same flexible regex check to current tabs iteration
+                    curr_tuples = []
+                    for t in curr_tabs:
+                        t_title = str(t.get("title", "")).strip()
+                        t_match = re.match(r"^(\d+)(?:-.*)?$", t_title)
+                        if t_match:
+                            curr_tuples.append((int(t_match.group(1)), str(t.get("id"))))
+                    
+                    try:
+                        curr_idx = [t[1] for t in curr_tuples].index(tid)
+                    except ValueError:
+                        continue
+                    if curr_idx != target_idx:
+                        subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "focus-tab", "--match", f"id:{tid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        diff = target_idx - curr_idx
+                        action_cmd = "move_tab_forward" if diff > 0 else "move_tab_backward"
+                        for _ in range(abs(diff)):
+                            subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "action", action_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+        break
+    except Exception:
+        pass
+' "$kitty_socket" 2>/dev/null
+}
 
 # ============================================================
 # MAIN EXECUTION FLOW
@@ -414,63 +529,20 @@ cp -- $RUNNER /tmp/xx
             for ENTRY in "${WINDOWS[@]}"; do
                 IFS='|' read -r WINDOW_ID INDEX NAME <<< "$ENTRY"
                 CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
+		kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
-                    kitty_cmd launch \
-                        --type=tab \
-                        --tab-title "$INDEX" \
-                        --title "$INDEX" \
-                        bash -c "printf '\033]2;%s\007' '$INDEX'; exec '$RUNNER' '$REMOTE' '$SESSION' '$WINDOW_ID'" \
-                        >/dev/null
-
+		    kitty_create_tab "$INDEX" "$NAME" "$RUNNER" "$REMOTE" "$SESSION" "$WINDOW_ID"
                     KNOWN_WINDOWS[$WINDOW_ID]=1
                     sleep 0.8  # Allow tab to initialize fully
 
                     # ONLY execute movement/sorting calculation right after launching a new tab
-                    python3 -c '
-import sys, json, subprocess
-socket_path = sys.argv[1]
-for _ in range(3): # Retry a couple times to ensure the new tab is fully registered in ls output
-    res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
-    if res.returncode != 0:
-        break
-    try:
-        data = json.loads(res.stdout)
-        tabs = data[0].get("tabs", [])
-        tab_tuples = []
-        for tab in tabs:
-            title = str(tab.get("title", "")).strip()
-            tab_id = str(tab.get("id"))
-            if title.isdigit():
-                tab_tuples.append((int(title), tab_id))
-        
-        if tab_tuples:
-            sorted_tuples = sorted(tab_tuples, key=lambda x: x[0])
-            titles = [t[0] for t in tab_tuples]
-            if titles != sorted(titles):
-                for target_idx, (val, tid) in enumerate(sorted_tuples):
-                    curr_res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
-                    if curr_res.returncode != 0:
-                        break
-                    curr_tabs = json.loads(curr_res.stdout)[0].get("tabs", [])
-                    curr_tuples = [(int(str(t.get("title","0")).strip()), str(t.get("id"))) for t in curr_tabs if str(t.get("title","0")).strip().isdigit()]
-                    try:
-                        curr_idx = [t[1] for t in curr_tuples].index(tid)
-                    except ValueError:
-                        continue
-                    if curr_idx != target_idx:
-                        subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "focus-tab", "--match", f"id:{tid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        diff = target_idx - curr_idx
-                        action_cmd = "move_tab_forward" if diff > 0 else "move_tab_backward"
-                        for _ in range(abs(diff)):
-                            subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "action", action_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        break
-    except Exception:
-        pass
-' "$KITTY_SOCKET" 2>/dev/null
+                    kitty_sort_tab $KITTY_SOCKET
+
                 fi
             done
+
 
             for WID in "${!KNOWN_WINDOWS[@]}"; do
                 if [[ -z "${CURRENT_ACTIVE_IDS[$WID]:-}" ]]; then
