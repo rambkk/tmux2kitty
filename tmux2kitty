@@ -517,8 +517,6 @@ import shlex
 import subprocess
 from pathlib import Path
 
-OUTPUT = Path.home() / ".kitty-current-tmux-window"
-
 def on_focus_change(boss, window, data):
     if not data["focused"]:
         return
@@ -531,46 +529,27 @@ def on_focus_change(boss, window, data):
             result = f"{cmdline[i - 1]}:{arg}"
             break
 
-    if result:
-        # OUTPUT.write_text(result)
+    if not result:
+        return
 
-        # Read environment variables
-        destination_host = os.environ.get("TMUX2KITTY_DESTINATION_HOST", "local")
-        ssh_opts_str = os.environ.get("TMUX2KITTY_SSHOPTS", "")
+    destination_host = os.environ.get(
+        "TMUX2KITTY_DESTINATION_HOST", "local"
+    )
+    ssh_opts_str = os.environ.get("TMUX2KITTY_SSHOPTS", "")
 
-        # 🚀 1. Fork the process into a background worker to avoid blocking the main UI thread
-        pid = -1
-        try:
-            pid = os.fork()
-            if pid > 0:
-                # This is the parent process (Kitty's main event loop)
-                # Return immediately so Kitty can continue running smoothly without lag
-                return 
-        except OSError:
-            # If the fork fails, fall back to standard synchronous execution for safety
-            pass
+    if destination_host == "local":
+        cmd = ["tmux", "select-window", "-t", result]
+    else:
+        ssh_opts = shlex.split(ssh_opts_str)
+        cmd = [ "ssh", *ssh_opts, destination_host, "tmux", "select-window", "-t", result]
 
-        # 🚀 2. Detach from the parent session so the child can run completely independently
-        if pid == 0:
-            os.setsid()
-
-        # -------------------------------------------------------------
-        # The code below runs entirely in the background without blocking Kitty
-        # -------------------------------------------------------------
-        if destination_host == "local":
-            # Run locally
-            subprocess.run(["tmux", "select-window", "-t", result])
-        else:
-            # Run remotely via SSH
-            ssh_opts = shlex.split(ssh_opts_str)
-            cmd = ["ssh"] + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
-            
-            # Redirect output to DEVNULL to prevent the background process from hanging (zombies)
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-        # 🚀 3. Terminate the child process safely once the task is complete
-        if pid == 0:
-            os._exit(0)
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 EOF
 }
 
