@@ -563,17 +563,7 @@ def on_focus_change(boss, window, data):
         else:
             # Run remotely via SSH
             ssh_opts = shlex.split(ssh_opts_str)
-            
-            # Inject performance-enhancing options (Multiplexing) and suppress output
-            if "-O" not in ssh_opts_str and "ControlPath" not in ssh_opts_str:
-                extra_opts = [
-                    "-o", "ControlMaster=auto",
-                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
-                    "-o", "ControlPersist=10m"
-                ]
-                cmd = ["ssh"] + extra_opts + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
-            else:
-                cmd = ["ssh"] + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
+            cmd = ["ssh"] + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
             
             # Redirect output to DEVNULL to prevent the background process from hanging (zombies)
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
