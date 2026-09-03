@@ -27,7 +27,19 @@ Make sure you have the following installed on your machine:
 - **`tmux`** installed both locally and on your remote target (if using remote mode)
 - **`jq`** command-line JSON processor (used for tracking and updating tab titles)
 - **Python 3** (used internally for precise tab sorting/matching)
+### Ubuntu / Debian
 
+Install the required packages:
+
+   ```bash
+      sudo apt update
+      sudo apt install tmux jq python3
+   ```
+
+Install Kitty:
+   ```bash
+      sudo apt install kitty
+   ```
 ---------
 
 ## Installation & Setup
