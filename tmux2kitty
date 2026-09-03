@@ -8,6 +8,35 @@
 set -u
 umask 0077
 
+SESSION=""
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/tmux-kitty}"
+DESTINATION_HOST=""
+LOCAL=""
+
+WORKDIR=""
+
+# Kitty control socket
+KITTY_SOCKET=""
+# SSH multiplexing socket
+SSH_CONTROL="$HOME/.ssh/control-%C"
+
+RECONNECT_DELAY=2
+POLL_INTERVAL=1
+
+# ============================================================
+# SSH OPTIONS
+# ============================================================
+
+SSH_OPTS=(
+    -o ControlMaster=auto
+    -o ControlPath="$SSH_CONTROL"
+    -o ControlPersist=10m
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o ConnectTimeout=10
+)
+
+
 # ============================================================
 # COMMAND LINE ARGUMENTS
 # ============================================================
@@ -26,25 +55,30 @@ usage() {
     echo "  $0 local -t mysession"
 }
 
-SESSION=""
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/tmux-kitty}"
 
+check_param()
+{
 # Exactly 1 argument: remote/local, prompt for session
 # Exactly 3 arguments: remote/local -t session, don't prompt
 
+local -n destination_host="$1"
+local -n session="$2"
+
+shift 2
+
 if [[ $# -eq 1 ]]; then
-    REMOTE="$1"
-    SESSION=""
+    destination_host="$1"
+    session=""
 elif [[ $# -eq 3 ]]; then
-    REMOTE="$1"
+    destination_host="$1"
 
     if [[ "$2" != "-t" || -z "$3" ]]; then
         usage
         exit 1
     fi
 
-    SESSION="$3"
-    if [[ ! "$SESSION" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
+    session="$3"
+    if [[ ! "$session" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
 	echo "Invalid session name. Allowed characters: letters, numbers, underscores, dots, and hyphens. Maximum length is 32 bytes." >&2
 	exit 1
     fi
@@ -53,16 +87,7 @@ else
     usage
     exit 1
 fi
-
-
-
-
-if [[ "$REMOTE" == "local" ]]; then
-    LOCAL=1
-else
-    LOCAL=0
-fi
-
+}
 
 create_runtime_dir()
 {
@@ -76,28 +101,6 @@ create_runtime_dir()
 }
 
 
-KITTY_SOCKET=""
-WORKDIR=""
-
-# SSH multiplexing socket
-SSH_CONTROL="$HOME/.ssh/control-%C"
-
-RECONNECT_DELAY=2
-POLL_INTERVAL=1
-
-
-# ============================================================
-# SSH OPTIONS
-# ============================================================
-
-SSH_OPTS=(
-    -o ControlMaster=auto
-    -o ControlPath="$SSH_CONTROL"
-    -o ControlPersist=10m
-    -o ServerAliveInterval=10
-    -o ServerAliveCountMax=3
-    -o ConnectTimeout=10
-)
 
 
 # ============================================================
@@ -117,20 +120,20 @@ trap cleanup EXIT
 ssh_master_alive()
 {
     [ "${LOCAL:-0}" -eq 1 ] && return 0
-    ssh "${SSH_OPTS[@]}" -O check "$REMOTE"  >/dev/null 2>&1
+    ssh "${SSH_OPTS[@]}" -O check "$DESTINATION_HOST"  >/dev/null 2>&1
 }
 
 check_ssh_socket()
 {
 	[ "${LOCAL:-0}" -eq 1 ] && return 0
 
-	SSH_HOST="$1"
-	SOCKET_PATH=$(ssh ${SSH_OPTS[@]} -G "$SSH_HOST" | awk '/^controlpath / {print $2}')
+	local ssh_host="$1"
+	local socket_path=$(ssh ${SSH_OPTS[@]} -G "$ssh_host" | awk '/^controlpath / {print $2}')
 
 	# Check if the file exists AND the connection test fails
-	if [ -S "$SOCKET_PATH" ] && ! ssh "${SSH_OPTS[@]}" -O check "$SSH_HOST" 2>/dev/null; then
+	if [ -S "$socket_path" ] && ! ssh "${SSH_OPTS[@]}" -O check "$ssh_host" 2>/dev/null; then
 	    echo "⚠️ Stale SSH session detected! Fixing..."
-	    rm -f -- "$SOCKET_PATH"
+	    rm -f -- "$socket_path"
 	fi
 
 }
@@ -139,7 +142,7 @@ start_ssh_master()
 {
     [ "${LOCAL:-0}" -eq 1 ] && return 0
 
-    echo "Connecting to $REMOTE..."
+    echo "Connecting to $DESTINATION_HOST..."
 
     # Is there already a working master?
     if ssh_master_alive; then
@@ -148,10 +151,10 @@ start_ssh_master()
     fi
 
     # There may be a stale control socket.
-    check_ssh_socket "$REMOTE"
+    check_ssh_socket "$DESTINATION_HOST"
 
     # No usable master: create one.
-    if ssh "${SSH_OPTS[@]}" -MNf "$REMOTE"; then
+    if ssh "${SSH_OPTS[@]}" -MNf "$DESTINATION_HOST"; then
         echo "SSH master connected."
         return 0
     fi
@@ -177,7 +180,7 @@ ssh_remote()
     if [ "${LOCAL:-0}" -eq 1 ]; then
 	eval "$1"
     else
-        ssh "${SSH_OPTS[@]}" "$REMOTE" -- "$1"
+        ssh "${SSH_OPTS[@]}" "$DESTINATION_HOST" -- "$1"
     fi
 }
 
@@ -193,7 +196,7 @@ tmux_all_session_list()
     echo " TMUX REMOTE GUI LAUNCHER"
     echo "=========================================="
     
-    echo "Active remote sessions on $REMOTE:"
+    echo "Active remote sessions on $DESTINATION_HOST:"
     if ! ssh_remote "tmux ls" >/dev/null 2>&1; then
         echo "  (No active tmux sessions found)"
     else
@@ -252,8 +255,9 @@ tmux_select_or_create_session()
 
 init_kitty()
 {
-    local kitty_socket="$1"
-    local -n ref_kitty_pid="$2"
+    local kitty_socket="$KITTY_SOCKET"
+    local -n ref_kitty_pid="$1"
+    local tab_watcher="$2"
     rm -f -- "$kitty_socket"
 
     echo "Starting Kitty terminal..."
@@ -267,6 +271,7 @@ init_kitty()
         -o mouse_map="wheel_down ungrabbed scroll_line_down" \
         -o tab_title_template="{title}" \
         -o dynamic_title=yes \
+        --watcher "${tab_watcher}" \
         --listen-on "unix:${kitty_socket}" &
 
     local kitty_pid=$!
@@ -309,7 +314,6 @@ kitty_create_tab()
                         >/dev/null
 
                     KNOWN_WINDOWS[$WINDOW_ID]=1
-                    sleep 0.8  # Allow tab to initialize fully
 
 }
 
@@ -318,95 +322,266 @@ kitty_sync_tab_title()
     local window_ref="$1"
     local index="$2"
     local name="$3"
+
+    local clean_ref
+    local tab_id
+    local expected_title
+    local current_title
+
     
     # Remove leading '@' if it exists (e.g., turn "@0" into "0")
-    CLEAN_REF="${window_ref#@}"
+    clean_ref="${window_ref#@}"
 
     # 1. Determine the expected title
     if [ -n "$NAME" ]; then
-        EXPECTED_TITLE="${index}-${name}"
+        expected_title="${index}-${name}"
     else
-        EXPECTED_TITLE="${index}"
+        expected_title="${index}"
     fi
 
     # 2. Find the actual Kitty Tab ID by searching for the reference in the cmdline
     # This checks if any command-line argument matches the reference (with or without '@')
-    TAB_ID=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$CLEAN_REF" '
+    tab_id=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$clean_ref" '
         .[].tabs[] 
         | select(.windows[].cmdline[]? | . == $ref or . == "@" + $clean_ref) 
         | .id
     ' | head -n 1)
 
     # 3. If a valid Tab ID was found, check and update its title
-    if [ -n "$TAB_ID" ]; then
-        CURRENT_TITLE=$(kitty_cmd ls | jq -r --arg id "$TAB_ID" '.[].tabs[] | select(.id|tostring == $id) | .title // empty')
+    if [ -n "$tab_id" ]; then
+        current_title=$(kitty_cmd ls | jq -r --arg id "$tab_id" '.[].tabs[] | select(.id|tostring == $id) | .title // empty')
 
-        if [ "$CURRENT_TITLE" != "$EXPECTED_TITLE" ]; then
-            kitty_cmd set-tab-title --match "id:$TAB_ID" "$EXPECTED_TITLE"
-            kitty_cmd set-window-title --match "id:$TAB_ID" "$EXPECTED_TITLE"
+        if [ "$current_title" != "$expected_title" ]; then
+            kitty_cmd set-tab-title --match "id:$tab_id" "$expected_title"
+            kitty_cmd set-window-title --match "id:$tab_id" "$expected_title"
         fi
+    fi
+}
+
+switch_tab() {
+    local window_ref="$1"
+    local clean_ref="${window_ref#@}"
+
+    tab_id=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$clean_ref" '
+        .[].tabs[] 
+        | select(.windows[].cmdline[]? | . == $ref or . == "@" + $clean_ref) 
+        | .id
+    ' | head -n 1)
+ 
+    if [ -n "$tab_id" ]; then
+            kitty_cmd focus-tab --match "id:$tab_id"
     fi
 }
 
 kitty_sort_tab()
 {
-   local kitty_socket="$1"
+   local kitty_socket="$KITTY_SOCKET"
 
    python3 -c '
-import sys, json, subprocess, re
+import sys
+import json
+import subprocess
+import re
 
 socket_path = sys.argv[1]
-for _ in range(3): # Retry a couple times to ensure the new tab is fully registered in ls output
-    res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
-    if res.returncode != 0:
-        break
+
+# Get the current tabs once.
+res = subprocess.run(
+    ["kitty", "@", "--to", f"unix:{socket_path}", "ls"],
+    capture_output=True,
+    text=True,
+)
+
+if res.returncode != 0:
+    sys.exit(1)
+
+try:
+    data = json.loads(res.stdout)
+    tabs = data[0].get("tabs", [])
+except (json.JSONDecodeError, IndexError, TypeError):
+    sys.exit(1)
+
+
+# Extract numbered tabs.
+# Matches:
+#   1
+#   2-name
+#   123-something
+#
+# Does not match:
+#   name
+#   foo-123
+#   abc
+numbered = []
+
+for index, tab in enumerate(tabs):
+    title = str(tab.get("title", "")).strip()
+    tab_id = str(tab.get("id"))
+
+    match = re.match(r"^(\d+)(?:-.*)?$", title)
+
+    if match:
+        numbered.append({
+            "number": int(match.group(1)),
+            "id": tab_id,
+            "index": index,
+        })
+
+
+if len(numbered) < 2:
+    sys.exit(0)
+
+
+# Desired order of the numbered tabs.
+desired = sorted(numbered, key=lambda x: x["number"])
+
+# Work on a copy of the actual tab order.
+#
+# This contains ALL tabs, including unnumbered ones, so that we
+# can correctly simulate physical tab positions without asking
+# Kitty for the state again.
+current = [str(tab.get("id")) for tab in tabs]
+
+# The numbered tabs should appear in numeric order relative to
+# each other. Unnumbered tabs are left in their existing positions.
+#
+# We process the desired numbered tabs from left to right.
+numbered_positions = [
+    i for i, tab_id in enumerate(current)
+    if any(item["id"] == tab_id for item in numbered)
+]
+
+for target_position, item in zip(numbered_positions, desired):
+    tab_id = item["id"]
+
+    # Where is this tab currently?
     try:
-        data = json.loads(res.stdout)
-        tabs = data[0].get("tabs", [])
-        tab_tuples = []
-        for tab in tabs:
-            title = str(tab.get("title", "")).strip()
-            tab_id = str(tab.get("id"))
-            
-            # Match either XXX or XXX-name (digits at the start, optional hyphen + text)
-            match = re.match(r"^(\d+)(?:-.*)?$", title)
-            if match:
-                tab_num = int(match.group(1))
-                tab_tuples.append((tab_num, tab_id))
-        
-        if tab_tuples:
-            sorted_tuples = sorted(tab_tuples, key=lambda x: x[0])
-            titles = [t[0] for t in tab_tuples]
-            if titles != sorted(titles):
-                for target_idx, (val, tid) in enumerate(sorted_tuples):
-                    curr_res = subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "ls"], capture_output=True, text=True)
-                    if curr_res.returncode != 0:
-                        break
-                    curr_tabs = json.loads(curr_res.stdout)[0].get("tabs", [])
-                    
-                    # Apply the same flexible regex check to current tabs iteration
-                    curr_tuples = []
-                    for t in curr_tabs:
-                        t_title = str(t.get("title", "")).strip()
-                        t_match = re.match(r"^(\d+)(?:-.*)?$", t_title)
-                        if t_match:
-                            curr_tuples.append((int(t_match.group(1)), str(t.get("id"))))
-                    
-                    try:
-                        curr_idx = [t[1] for t in curr_tuples].index(tid)
-                    except ValueError:
-                        continue
-                    if curr_idx != target_idx:
-                        subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "focus-tab", "--match", f"id:{tid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        diff = target_idx - curr_idx
-                        action_cmd = "move_tab_forward" if diff > 0 else "move_tab_backward"
-                        for _ in range(abs(diff)):
-                            subprocess.run(["kitty", "@", "--to", f"unix:{socket_path}", "action", action_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        break
-        break
-    except Exception:
-        pass
+        current_position = current.index(tab_id)
+    except ValueError:
+        continue
+
+    if current_position == target_position:
+        continue
+
+    # Focus the tab were moving.
+    subprocess.run(
+        [
+            "kitty",
+            "@",
+            "--to",
+            f"unix:{socket_path}",
+            "focus-tab",
+            "--match",
+            f"id:{tab_id}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Move it to its desired physical position.
+    diff = target_position - current_position
+
+    action = (
+        "move_tab_forward"
+        if diff > 0
+        else "move_tab_backward"
+    )
+
+    for _ in range(abs(diff)):
+        subprocess.run(
+            [
+                "kitty",
+                "@",
+                "--to",
+                f"unix:{socket_path}",
+                "action",
+                action,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    # Update our internal representation to reflect the move.
+    tab = current.pop(current_position)
+    current.insert(target_position, tab)
 ' "$kitty_socket" 2>/dev/null
+}
+
+create_tab_watcher()
+{
+    local tab_watcher="$1"
+    cat > "$tab_watcher" <<'EOF'
+import os
+import re
+import shlex
+import subprocess
+from pathlib import Path
+
+OUTPUT = Path.home() / ".kitty-current-tmux-window"
+
+def on_focus_change(boss, window, data):
+    if not data["focused"]:
+        return
+
+    result = ""
+    cmdline = window.child.cmdline
+
+    for i, arg in enumerate(cmdline):
+        if re.fullmatch(r"@\d+", arg) and i > 0:
+            result = f"{cmdline[i - 1]}:{arg}"
+            break
+
+    if result:
+        # OUTPUT.write_text(result)
+
+        # Read environment variables
+        destination_host = os.environ.get("TMUX2KITTY_DESTINATION_HOST", "local")
+        ssh_opts_str = os.environ.get("TMUX2KITTY_SSHOPTS", "")
+
+        # 🚀 1. แตก Process ออกเป็นร่างเงา (Fork) เพื่อทำตัวเป็น Background Worker
+        pid = -1
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # นี่คือ Parent Process (สคริปต์หลักของ Kitty) 
+                # สั่ง return ทันทีเพื่อให้ Kitty ปล่อยผ่านและทำงานต่อได้อย่างลื่นไหล
+                return 
+        except OSError:
+            # หาก Fork ล้มเหลว ให้ fallback มารันแบบปกติเพื่อความปลอดภัย
+            pass
+
+        # 🚀 2. ตัดการเชื่อมต่อจาก Session หลัก เพื่อให้ทำงานอิสระใน Background ได้สมบูรณ์
+        if pid == 0:
+            os.setsid()
+
+        # -------------------------------------------------------------
+        # โค้ดส่วนนี้จะทำงานใน Background โดยที่ Kitty ไม่รับรู้และไม่ต้องรอแล้ว
+        # -------------------------------------------------------------
+        if destination_host == "local":
+            # Run locally
+            subprocess.run(["tmux", "select-window", "-t", result])
+        else:
+            # Run remotely via SSH
+            ssh_opts = shlex.split(ssh_opts_str)
+            
+            # บังคับใส่ออปชันเพื่อความเร็ว (Multiplexing) และตัด Output ทิ้งไม่ให้ค้างในระบบ
+            if "-O" not in ssh_opts_str and "ControlPath" not in ssh_opts_str:
+                extra_opts = [
+                    "-o", "ControlMaster=auto",
+                    "-o", "ControlPath=~/.ssh/control-%r@%h:%p",
+                    "-o", "ControlPersist=10m"
+                ]
+                cmd = ["ssh"] + extra_opts + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
+            else:
+                cmd = ["ssh"] + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
+            
+            # ส่ง Output ไปที่ DEVNULL เพื่อป้องกัน Background Process ค้าง (Zombie)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+        # 🚀 3. เมื่อร่างเงาทำงานเสร็จแล้ว ให้สั่งปลดตัวเองออกจากระบบทันที
+        if pid == 0:
+            os._exit(0)
+EOF
 }
 
 create_runner()
@@ -422,7 +597,7 @@ else
     LOCAL=0
 fi
 
-REMOTE="$1"
+DESTINATION_HOST="$1"
 SESSION="$2"
 WINDOW_ID="$3"
 
@@ -443,14 +618,14 @@ ssh_remote()
     if [ "${LOCAL:-0}" -eq 1 ]; then
 	eval "$1"
     else
-        ssh "${SSH_OPTS[@]}" "$REMOTE" -- "$1"
+        ssh "${SSH_OPTS[@]}" "$DESTINATION_HOST" -- "$1"
     fi
 }
 
 ssh_master_alive()
 {
 [ "${LOCAL:-0}" -eq 1 ] && return 0
-    ssh "${SSH_OPTS[@]}" -O check "$REMOTE" >/dev/null 2>&1
+    ssh "${SSH_OPTS[@]}" -O check "$DESTINATION_HOST" >/dev/null 2>&1
 }
 
 SAFE_WID=$(echo "$WINDOW_ID" | tr '@%' '_')
@@ -520,6 +695,13 @@ tmux_window_list() {
 	local window_list_command="tmux list-windows -t '=${session}' -F '#{window_id}|#{window_index}|#{window_name}'"
 	ssh_remote "$window_list_command" 2>/dev/null
 }
+
+tmux_get_active_winid() {
+	local session="$1"
+	local get_activeid_command="tmux display-message -t '$session' -p '#{window_id}'"
+	ssh_remote "$get_activeid_command" 2>/dev/null
+}
+
         
 # ============================================================
 # MAIN EXECUTION FLOW
@@ -528,15 +710,26 @@ tmux_window_list() {
 main()
 {
     # Before starting, create runtime directory
+    check_param "DESTINATION_HOST" "SESSION" $@
     create_runtime_dir $RUNTIME_DIR
+    if [[ "$DESTINATION_HOST" == "local" ]]; then
+         LOCAL=1
+    else
+         LOCAL=0
+    fi
+
+    export TMUX2KITTY_DESTINATION_HOST=$DESTINATION_HOST
+    export TMUX2KITTY_SSHOPTS="${SSH_OPTS[*]}"
 
     # 1. Initialize SSH multiplexing control channel first
     init_ssh_control
 
     # 2. Present startup session menu
-    tmux_all_session_list $REMOTE
+    tmux_all_session_list $DESTINATION_HOST
     # $SESSION update by reference
-    input_session_name "SESSION"
+    if [[ -z "$SESSION" ]]; then
+         input_session_name "SESSION"
+    fi
 
     SESSION_DIR="$RUNTIME_DIR/$SESSION"
     WORKDIR="$SESSION_DIR/work"
@@ -554,14 +747,17 @@ main()
     echo "Purging stale remote tab sessions..."
     tmux_purge_stale $SESSION 
 
-    # 4. Initialize local Kitty terminal instance
-    # $KITTY_PID update by reference
-    init_kitty $KITTY_SOCKET "KITTY_PID" || exit 1
-
-    # 5. Create tab runner script
+    # Create tab runner script
     RUNNER="$WORKDIR/remote-tmux-tab.sh"
     create_runner $RUNNER
 
+    # Create tab runner script
+    TAB_WATCHER="$WORKDIR/tabwatcher.py"
+    create_tab_watcher $TAB_WATCHER
+
+    # Initialize local Kitty terminal instance
+    # $KITTY_PID update by reference
+    init_kitty "KITTY_PID" $TAB_WATCHER || exit 1
 
     declare -A KNOWN_WINDOWS
 
@@ -569,12 +765,17 @@ main()
     echo "=========================================="
     echo " Remote tmux GUI started (Native Scrolling)"
     echo "=========================================="
-    echo "Remote : $REMOTE"
+    echo "Remote : $DESTINATION_HOST"
     echo "Session: $SESSION"
     echo "Kitty  : $KITTY_PID"
     echo
 
-    # 6. Continuous monitoring loop
+    local active_winid=$(tmux_get_active_winid $SESSION)
+	
+    local first_run=1
+    local created_new_tab=0
+
+    # 7. Continuous monitoring loop
     while true; do
         tmux_window_to_session $SESSION
 
@@ -584,19 +785,30 @@ main()
                 IFS='|' read -r WINDOW_ID INDEX NAME <<< "$ENTRY"
                 CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
 
-		kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
+                if [ -S "$KITTY_SOCKET" ]; then
+                    kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
+		fi
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
+                    kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
-		    kitty_create_tab "$INDEX" "$NAME" "$RUNNER" "$REMOTE" "$SESSION" "$WINDOW_ID"
+		    kitty_create_tab "$INDEX" "$NAME" "$RUNNER" "$DESTINATION_HOST" "$SESSION" "$WINDOW_ID"
                     KNOWN_WINDOWS[$WINDOW_ID]=1
-                    sleep 0.8  # Allow tab to initialize fully
-
-                    # ONLY execute movement/sorting calculation right after launching a new tab
-                    kitty_sort_tab $KITTY_SOCKET
-
+                    created_new_tab=1
                 fi
             done
+
+            if [ "$created_new_tab" -eq 1 ]; then
+                kitty_sort_tab
+                created_new_tab=0
+            fi
+
+            if [ "$first_run" -eq 1 ]; then
+                if [ -n "$active_winid" ]; then
+                    switch_tab $active_winid
+                fi
+                first_run=0
+            fi
 
 
             for WID in "${!KNOWN_WINDOWS[@]}"; do
