@@ -538,24 +538,24 @@ def on_focus_change(boss, window, data):
         destination_host = os.environ.get("TMUX2KITTY_DESTINATION_HOST", "local")
         ssh_opts_str = os.environ.get("TMUX2KITTY_SSHOPTS", "")
 
-        # 🚀 1. แตก Process ออกเป็นร่างเงา (Fork) เพื่อทำตัวเป็น Background Worker
+        # 🚀 1. Fork the process into a background worker to avoid blocking the main UI thread
         pid = -1
         try:
             pid = os.fork()
             if pid > 0:
-                # นี่คือ Parent Process (สคริปต์หลักของ Kitty) 
-                # สั่ง return ทันทีเพื่อให้ Kitty ปล่อยผ่านและทำงานต่อได้อย่างลื่นไหล
+                # This is the parent process (Kitty's main event loop)
+                # Return immediately so Kitty can continue running smoothly without lag
                 return 
         except OSError:
-            # หาก Fork ล้มเหลว ให้ fallback มารันแบบปกติเพื่อความปลอดภัย
+            # If the fork fails, fall back to standard synchronous execution for safety
             pass
 
-        # 🚀 2. ตัดการเชื่อมต่อจาก Session หลัก เพื่อให้ทำงานอิสระใน Background ได้สมบูรณ์
+        # 🚀 2. Detach from the parent session so the child can run completely independently
         if pid == 0:
             os.setsid()
 
         # -------------------------------------------------------------
-        # โค้ดส่วนนี้จะทำงานใน Background โดยที่ Kitty ไม่รับรู้และไม่ต้องรอแล้ว
+        # The code below runs entirely in the background without blocking Kitty
         # -------------------------------------------------------------
         if destination_host == "local":
             # Run locally
@@ -564,7 +564,7 @@ def on_focus_change(boss, window, data):
             # Run remotely via SSH
             ssh_opts = shlex.split(ssh_opts_str)
             
-            # บังคับใส่ออปชันเพื่อความเร็ว (Multiplexing) และตัด Output ทิ้งไม่ให้ค้างในระบบ
+            # Inject performance-enhancing options (Multiplexing) and suppress output
             if "-O" not in ssh_opts_str and "ControlPath" not in ssh_opts_str:
                 extra_opts = [
                     "-o", "ControlMaster=auto",
@@ -575,10 +575,10 @@ def on_focus_change(boss, window, data):
             else:
                 cmd = ["ssh"] + ssh_opts + [destination_host, "tmux", "select-window", "-t", result]
             
-            # ส่ง Output ไปที่ DEVNULL เพื่อป้องกัน Background Process ค้าง (Zombie)
+            # Redirect output to DEVNULL to prevent the background process from hanging (zombies)
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-        # 🚀 3. เมื่อร่างเงาทำงานเสร็จแล้ว ให้สั่งปลดตัวเองออกจากระบบทันที
+        # 🚀 3. Terminate the child process safely once the task is complete
         if pid == 0:
             os._exit(0)
 EOF
