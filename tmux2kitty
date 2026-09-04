@@ -678,23 +678,31 @@ tmux_get_active_winid() {
 
 main()
 {
+    #
     # Before starting, create runtime directory
+    # $DESTINATION_HOST and $SESSION update by reference
+    #
     check_param "DESTINATION_HOST" "SESSION" $@
     create_runtime_dir $RUNTIME_DIR
+
+    # Check local or remote session
     if [[ "$DESTINATION_HOST" == "local" ]]; then
          LOCAL=1
     else
          LOCAL=0
     fi
 
+    # export variables to be used from the watcher script
     export TMUX2KITTY_DESTINATION_HOST=$DESTINATION_HOST
     export TMUX2KITTY_SSHOPTS="${SSH_OPTS[*]}"
 
-    # 1. Initialize SSH multiplexing control channel first
+    # Initialize SSH multiplexing control channel
     init_ssh_control
 
-    # 2. Present startup session menu
+    # Present startup session menu
     tmux_all_session_list $DESTINATION_HOST
+
+    # if command line do not have SESSION then ask
     # $SESSION update by reference
     if [[ -z "$SESSION" ]]; then
          input_session_name "SESSION"
@@ -702,17 +710,16 @@ main()
 
     SESSION_DIR="$RUNTIME_DIR/$SESSION"
     WORKDIR="$SESSION_DIR/work"
+    KITTY_SOCKET="$SESSION_DIR/kitty.sock"
 
     mkdir -p  -- "$SESSION_DIR"
     rm    -rf -- "$WORKDIR"
     mkdir -p  -- "$WORKDIR"
     chmod 700 -- "$SESSION_DIR" "$WORKDIR"
 
-    KITTY_SOCKET="$SESSION_DIR/kitty.sock"
-
     tmux_select_or_create_session $SESSION
 
-    # 3. Purge stale remote tab sessions from previous runs for this session safely
+    # Purge stale remote tab sessions from previous runs for this session safely
     echo "Purging stale remote tab sessions..."
     tmux_purge_stale $SESSION 
 
@@ -720,7 +727,7 @@ main()
     RUNNER="$WORKDIR/remote-tmux-tab.sh"
     create_runner $RUNNER
 
-    # Create tab runner script
+    # Create tab watcher script for updating active window to tmux
     TAB_WATCHER="$WORKDIR/tabwatcher.py"
     create_tab_watcher $TAB_WATCHER
 
@@ -744,8 +751,9 @@ main()
     local first_run=1
     local created_new_tab=0
 
-    # 7. Continuous monitoring loop
+    # Continuous monitoring loop
     while true; do
+        # Create a new session for each window
         tmux_window_to_session $SESSION
 
         if mapfile -t WINDOWS < <(tmux_window_list $SESSION); then
@@ -759,7 +767,6 @@ main()
 		fi
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
-                    kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
 		    kitty_create_tab "$INDEX" "$NAME" "$RUNNER" "$DESTINATION_HOST" "$SESSION" "$WINDOW_ID"
                     KNOWN_WINDOWS[$WINDOW_ID]=1
