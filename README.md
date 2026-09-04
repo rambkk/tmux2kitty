@@ -1,9 +1,20 @@
 # tmux2kitty
-Turn tmux windows into native Kitty tabs.
+# Native Kitty tabs for tmux and remote sessions
 
-> **Turn existing and new tmux windows into synchronized native Kitty tabs.**
+> **Use Kitty's native tabs with persistent tmux sessions — including remote sessions.**
 
-`tmux2kitty` is a lightweight Bash utility that seamlessly turns existing and new tmux windows into native Kitty tabs — and keeps them synchronized. It can attach to an existing tmux session and automatically recreate each of its windows as a Kitty tab, while continuing to watch the session for newly created or closed windows.
+If you're looking for a terminal emulator that natively works with tmux or GNU Screen, tmux2kitty brings tmux's persistent sessions together with Kitty's tabs—giving you the best of both worlds.
+
+**tmux is the modern replacement for GNU Screen.** It keeps your terminal sessions, windows, and processes alive even when you disconnect. `tmux2kitty` lets Kitty display those tmux windows as **native Kitty tabs**, so you get the persistence of tmux without giving up Kitty's tab management.
+
+It can:
+
+* Attach to an existing local or **remote tmux session** and recreate its windows as native Kitty tabs.
+* Automatically **resume remote tmux sessions** when you open Kitty again.
+* Keep Kitty tabs synchronized with tmux as windows are created, renamed, or closed.
+* Turn newly created tmux windows into Kitty tabs automatically.
+
+**tmux keeps your sessions alive. Kitty provides the native terminal UI. `tmux2kitty` connects them.**
 
 ---------
 
