@@ -39,7 +39,7 @@ SSH_OPTS=(
 SESSION_REGEX='^[A-Za-z0-9_.-]{1,32}$'
 TMUX_WINID_REGEX='^@?[0-9]{1,6}$'
 TMUX_INDEX_REGEX='^[0-9]{1,6}$'
-TMUX_WINNAME_REGEX='^[^[:cntrl:]]{1,32}$'
+TMUX_WINNAME_REGEX='^[^[:cntrl:]]{0,32}$'
 
 
 
@@ -892,7 +892,7 @@ main()
 
                 CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
 
-                kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
+                kitty_sync_tab_title "$WINDOW_ID" "$INDEX" "$NAME"
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
