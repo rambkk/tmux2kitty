@@ -36,6 +36,12 @@ SSH_OPTS=(
     -o ConnectTimeout=10
 )
 
+SESSION_REGEX='^[A-Za-z0-9_.-]{1,32}$'
+TMUX_WINID_REGEX='^@?[0-9]{1,6}$'
+TMUX_INDEX_REGEX='^[0-9]{1,6}$'
+TMUX_WINNAME_REGEX='^[^[:cntrl:]]{1,32}$'
+
+
 
 # ============================================================
 # COMMAND LINE ARGUMENTS
@@ -78,7 +84,7 @@ elif [[ $# -eq 3 ]]; then
     fi
 
     session="$3"
-    if [[ ! "$session" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
+    if [[ ! "$session" =~ $SESSION_REGEX ]]; then
 	echo "Invalid session name. Allowed characters: letters, numbers, underscores, dots, and hyphens. Maximum length is 32 bytes." >&2
 	exit 1
     fi
@@ -224,7 +230,7 @@ input_session_name()
 		echo "Using session: $session"
 	    fi
 
-	    if [[ "$session" =~ ^[A-Za-z0-9_.-]{1,32}+$ ]]; then
+	    if [[ "$session" =~ $SESSION_REGEX ]]; then
 		break
 	    fi
 
@@ -292,9 +298,13 @@ init_kitty()
 kitty_cmd()
 {
     local kitty_socket="$KITTY_SOCKET"
-    kitty @ \
-        --to "unix:${kitty_socket}" \
-        "$@"
+    if [ -S "$KITTY_SOCKET" ]; then
+       kitty @ \
+           --to "unix:${kitty_socket}" \
+           "$@"
+    else
+       do_exit 1 "Parent function was: ${FUNCNAME[1]}\nKitty socket not found: $KITTY_SOCKET"
+    fi
 }
 
 kitty_create_tab()
@@ -333,7 +343,7 @@ kitty_sync_tab_title()
     clean_ref="${window_ref#@}"
 
     # 1. Determine the expected title
-    if [ -n "$NAME" ]; then
+    if [ -n "$name" ]; then
         expected_title="${index}-${name}"
     else
         expected_title="${index}"
@@ -358,7 +368,8 @@ kitty_sync_tab_title()
     fi
 }
 
-switch_tab() {
+switch_tab()
+{
     local window_ref="$1"
     local clean_ref="${window_ref#@}"
 
@@ -373,140 +384,6 @@ switch_tab() {
     fi
 }
 
-kitty_sort_tab()
-{
-   local kitty_socket="$KITTY_SOCKET"
-
-   python3 -c '
-import sys
-import json
-import subprocess
-import re
-
-socket_path = sys.argv[1]
-
-# Get the current tabs once.
-res = subprocess.run(
-    ["kitty", "@", "--to", f"unix:{socket_path}", "ls"],
-    capture_output=True,
-    text=True,
-)
-
-if res.returncode != 0:
-    sys.exit(1)
-
-try:
-    data = json.loads(res.stdout)
-    tabs = data[0].get("tabs", [])
-except (json.JSONDecodeError, IndexError, TypeError):
-    sys.exit(1)
-
-
-# Extract numbered tabs.
-# Matches:
-#   1
-#   2-name
-#   123-something
-#
-# Does not match:
-#   name
-#   foo-123
-#   abc
-numbered = []
-
-for index, tab in enumerate(tabs):
-    title = str(tab.get("title", "")).strip()
-    tab_id = str(tab.get("id"))
-
-    match = re.match(r"^(\d+)(?:-.*)?$", title)
-
-    if match:
-        numbered.append({
-            "number": int(match.group(1)),
-            "id": tab_id,
-            "index": index,
-        })
-
-
-if len(numbered) < 2:
-    sys.exit(0)
-
-
-# Desired order of the numbered tabs.
-desired = sorted(numbered, key=lambda x: x["number"])
-
-# Work on a copy of the actual tab order.
-#
-# This contains ALL tabs, including unnumbered ones, so that we
-# can correctly simulate physical tab positions without asking
-# Kitty for the state again.
-current = [str(tab.get("id")) for tab in tabs]
-
-# The numbered tabs should appear in numeric order relative to
-# each other. Unnumbered tabs are left in their existing positions.
-#
-# We process the desired numbered tabs from left to right.
-numbered_positions = [
-    i for i, tab_id in enumerate(current)
-    if any(item["id"] == tab_id for item in numbered)
-]
-
-for target_position, item in zip(numbered_positions, desired):
-    tab_id = item["id"]
-
-    # Where is this tab currently?
-    try:
-        current_position = current.index(tab_id)
-    except ValueError:
-        continue
-
-    if current_position == target_position:
-        continue
-
-    # Focus the tab were moving.
-    subprocess.run(
-        [
-            "kitty",
-            "@",
-            "--to",
-            f"unix:{socket_path}",
-            "focus-tab",
-            "--match",
-            f"id:{tab_id}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    # Move it to its desired physical position.
-    diff = target_position - current_position
-
-    action = (
-        "move_tab_forward"
-        if diff > 0
-        else "move_tab_backward"
-    )
-
-    for _ in range(abs(diff)):
-        subprocess.run(
-            [
-                "kitty",
-                "@",
-                "--to",
-                f"unix:{socket_path}",
-                "action",
-                action,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    # Update our internal representation to reflect the move.
-    tab = current.pop(current_position)
-    current.insert(target_position, tab)
-' "$kitty_socket" 2>/dev/null
-}
-
 create_tab_watcher()
 {
     local tab_watcher="$1"
@@ -515,17 +392,217 @@ import os
 import re
 import shlex
 import subprocess
-from pathlib import Path
+
+from kitty.fast_data_types import swap_tabs
+
+
+# ============================================================================
+# Numbered tab sorting
+# ============================================================================
+
+TAB_NUMBER_RE = re.compile(r"^(\d{1,6})(?:-|$)")
+
+
+def get_tab_number(tab):
+    """
+    Return the numeric prefix of a tab title.
+
+    Matches:
+        0
+        1
+        123
+        1-foo
+        123-something
+
+    Does not match:
+        foo
+        foo-123
+        123foo
+    """
+
+    match = TAB_NUMBER_RE.match(tab.effective_title)
+
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def sort_numbered_tabs(window):
+    """
+    Sort numbered tabs by their numeric prefix.
+
+    Tabs without a numeric prefix remain in exactly the same positions.
+
+    Example:
+
+        ~/kitty-tmux
+        2-bash
+        1-bash
+        foo
+        10-vim
+        3-shell
+
+    becomes:
+
+        ~/kitty-tmux
+        1-bash
+        2-bash
+        foo
+        3-shell
+        10-vim
+
+    Only positions occupied by numbered tabs are rearranged.
+    """
+
+    tab = window.tabref()
+
+    if tab is None:
+        return
+
+    tab_manager = tab.tab_manager_ref()
+
+    if tab_manager is None:
+        return
+
+    tabs = tab_manager.tabs
+
+    if len(tabs) < 2:
+        return
+
+    # ------------------------------------------------------------------------
+    # Find all numbered tabs.
+    # ------------------------------------------------------------------------
+
+    numbered = []
+
+    for index, current_tab in enumerate(tabs):
+        number = get_tab_number(current_tab)
+
+        if number is not None:
+            numbered.append(
+                (number, index, current_tab)
+            )
+
+    if len(numbered) < 2:
+        return
+
+    # ------------------------------------------------------------------------
+    # Find the positions occupied by numbered tabs.
+    #
+    # These positions are the only positions that are allowed to change.
+    # ------------------------------------------------------------------------
+
+    numbered_positions = [
+        index
+        for index, current_tab in enumerate(tabs)
+        if get_tab_number(current_tab) is not None
+    ]
+
+    # ------------------------------------------------------------------------
+    # Sort numerically.
+    #
+    # The original index is used as a secondary key so tabs with the same
+    # number retain their original relative order.
+    # ------------------------------------------------------------------------
+
+    numbered.sort(key=lambda item: (item[0], item[1]))
+
+    desired_tabs = [
+        current_tab
+        for _, _, current_tab in numbered
+    ]
+
+    # ------------------------------------------------------------------------
+    # Already sorted?
+    # ------------------------------------------------------------------------
+
+    if all(
+        tabs[position] is desired_tab
+        for position, desired_tab
+        in zip(numbered_positions, desired_tabs)
+    ):
+        return
+
+    # ------------------------------------------------------------------------
+    # Remember the active tab so sorting doesn't change what the user is
+    # looking at.
+    # ------------------------------------------------------------------------
+
+    active_tab = tab_manager.active_tab
+
+    # ------------------------------------------------------------------------
+    # Reorder the numbered tabs.
+    #
+    # We swap tabs directly rather than using move_tab_forward/backward.
+    #
+    # This is important because move_tab_forward/backward would move a
+    # numbered tab through unnumbered tabs. Direct swaps let us preserve
+    # the exact positions of unnumbered tabs.
+    # ------------------------------------------------------------------------
+
+    for target_position, desired_tab in zip(
+        numbered_positions,
+        desired_tabs,
+    ):
+        # Refresh the list because the previous swap changed its order.
+        tabs = tab_manager.tabs
+
+        current_position = tabs.index(desired_tab)
+
+        if current_position == target_position:
+            continue
+
+        # Update Kitty's Python-side tab ordering.
+        tabs[current_position], tabs[target_position] = (
+            tabs[target_position],
+            tabs[current_position],
+        )
+
+        # Update Kitty's actual OS/window tab ordering.
+        swap_tabs(
+            tab_manager.os_window_id,
+            current_position,
+            target_position,
+        )
+
+    # ------------------------------------------------------------------------
+    # Restore the previously active tab.
+    # ------------------------------------------------------------------------
+
+    if active_tab is not None:
+        tabs = tab_manager.tabs
+        active_position = tabs.index(active_tab)
+
+        tab_manager._set_active_tab(
+            active_position,
+            store_in_history=False,
+        )
+
+    tab_manager.mark_tab_bar_dirty()
+
+
+# ============================================================================
+# Focused Kitty tab update to tmux active window
+# ============================================================================
 
 def on_focus_change(boss, window, data):
     if not data["focused"]:
         return
 
+    # Sort numbered tabs independently from the tmux logic.
+    sort_numbered_tabs(window)
+
     result = ""
     cmdline = window.child.cmdline
 
     for i, arg in enumerate(cmdline):
-        if re.fullmatch(r"@\d+", arg) and i > 0:
+        if (
+            i > 0
+            and re.fullmatch(r"@\d{1,6}", arg)
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", cmdline[i - 1]
+            )
+        ):
             result = f"{cmdline[i - 1]}:{arg}"
             break
 
@@ -533,15 +610,34 @@ def on_focus_change(boss, window, data):
         return
 
     destination_host = os.environ.get(
-        "TMUX2KITTY_DESTINATION_HOST", "local"
+        "TMUX2KITTY_DESTINATION_HOST",
+        "local",
     )
-    ssh_opts_str = os.environ.get("TMUX2KITTY_SSHOPTS", "")
+
+    ssh_opts_str = os.environ.get(
+        "TMUX2KITTY_SSHOPTS",
+        "",
+    )
 
     if destination_host == "local":
-        cmd = ["tmux", "select-window", "-t", result]
+        cmd = [
+            "tmux",
+            "select-window",
+            "-t",
+            result,
+        ]
     else:
         ssh_opts = shlex.split(ssh_opts_str)
-        cmd = [ "ssh", *ssh_opts, destination_host, "tmux", "select-window", "-t", result]
+
+        cmd = [
+            "ssh",
+            *ssh_opts,
+            destination_host,
+            "tmux",
+            "select-window",
+            "-t",
+            result,
+        ]
 
     subprocess.Popen(
         cmd,
@@ -550,6 +646,14 @@ def on_focus_change(boss, window, data):
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+# ============================================================================
+# Sort when a tab title changes
+# ============================================================================
+
+def on_title_change(boss, window, data):
+    sort_numbered_tabs(window)
 EOF
 }
 
@@ -620,7 +724,8 @@ while true; do
             tmux kill-window -t '${TAB_SESSION}:0' 2>/dev/null || true
             tmux set-option -t '${TAB_SESSION}' mouse off
             tmux set-option -t '${TAB_SESSION}' alternate-screen off
-            tmux set-option status off
+            tmux set-option -t '${TAB_SESSION}' status off
+            tmux set-option -t '${TAB_SESSION}' default-terminal 'xterm-256color'
             tmux set-option -ga terminal-overrides ',xterm*:smcup@:rmcup@'
         fi" > /dev/null 2>&1
 
@@ -650,7 +755,10 @@ tmux_window_to_session()
         local session="$1"
         ssh_remote "
             for s in \$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${session}__'); do
+                [[ \"\$s\" =~ $SESSION_REGEX ]] || continue
                 for wid in \$(tmux list-windows -t \"\$s\" -F '#{window_id}' 2>/dev/null); do
+                    # Skip to the next window if the ID doesn't match the required format
+                    [[ \"\$wid\" =~ $TMUX_WINID_REGEX ]] || continue
                     if ! tmux list-windows -t '=${session}' -F '#{window_id}' 2>/dev/null | grep -q \"\$wid\"; then
                         tmux move-window -s \"\$s:\$wid\" -t '=${session}:' 2>/dev/null || true
                     fi
@@ -671,6 +779,16 @@ tmux_get_active_winid() {
 	ssh_remote "$get_activeid_command" 2>/dev/null
 }
 
+
+do_exit()
+{
+	local exit_code="$1"
+	
+	shift
+
+	echo "$@"
+	exit $exit_code
+}
         
 # ============================================================
 # MAIN EXECUTION FLOW
@@ -753,6 +871,9 @@ main()
 
     # Continuous monitoring loop
     while true; do
+        if [ ! -S "$KITTY_SOCKET" ]; then
+            do_exit 0 "Kitty socket not found, exiting normally..." 
+        fi
         # Create a new session for each window
         tmux_window_to_session $SESSION
 
@@ -760,11 +881,18 @@ main()
             declare -A CURRENT_ACTIVE_IDS
             for ENTRY in "${WINDOWS[@]}"; do
                 IFS='|' read -r WINDOW_ID INDEX NAME <<< "$ENTRY"
+
+		[[ "$WINDOW_ID" =~ $TMUX_WINID_REGEX   ]] || continue
+		[[ "$INDEX"     =~ $TMUX_INDEX_REGEX   ]] || continue
+		[[ "$NAME"      =~ $TMUX_WINNAME_REGEX ]] || continue
+
+                # Remove control characters from the strings eg. literal \r \n etc.
+                printf -v NAME '%b' "$NAME"
+                NAME="${NAME//[[:cntrl:]]}"
+
                 CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
 
-                if [ -S "$KITTY_SOCKET" ]; then
-                    kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
-		fi
+                kitty_sync_tab_title $WINDOW_ID $INDEX $NAME
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
@@ -775,7 +903,6 @@ main()
             done
 
             if [ "$created_new_tab" -eq 1 ]; then
-                kitty_sort_tab
                 created_new_tab=0
             fi
 
