@@ -303,7 +303,7 @@ kitty_cmd()
            --to "unix:${kitty_socket}" \
            "$@"
     else
-       do_exit 1 "Parent function was: ${FUNCNAME[1]}\nKitty socket not found: $KITTY_SOCKET"
+       do_exit 1 "Parent function was: ${FUNCNAME[1]} - Kitty socket not found: $KITTY_SOCKET - Exiting"
     fi
 }
 
@@ -593,14 +593,32 @@ def on_focus_change(boss, window, data):
     # Sort numbered tabs independently from the tmux logic.
     sort_numbered_tabs(window)
 
+    session_regex = os.getenv("TMUX2KITTY_SESSION_REGEX")
+    if session_regex is None:
+        raise RuntimeError("TMUX2KITTY_SESSION_REGEX environment variable is not set")
+
+    tmux_winid_regex = os.getenv("TMUX2KITTY_TMUX_WINID_REGEX")
+    if tmux_winid_regex is None:
+        raise RuntimeError("TMUX2KITTY_TMUX_WINID_REGEX environment variable is not set")
+
+    destination_host = os.getenv("TMUX2KITTY_DESTINATION_HOST")
+    if destination_host is None:
+        raise RuntimeError("TMUX2KITTY_DESTINATION_HOST environment variable is not set")
+
+    ssh_opts_str = os.getenv("TMUX2KITTY_SSHOPTS")
+    if ssh_opts_str is None:
+        raise RuntimeError("TMUX2KITTY_SSHOPTS environment variable is not set")
+
+
+
     result = ""
     cmdline = window.child.cmdline
 
     for i, arg in enumerate(cmdline):
         if (
             i > 0
-            and re.fullmatch(r"@\d{1,6}", arg)
-            and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", cmdline[i - 1]
+            and re.fullmatch(tmux_winid_regex, arg)
+            and re.fullmatch(session_regex, cmdline[i - 1]
             )
         ):
             result = f"{cmdline[i - 1]}:{arg}"
@@ -608,16 +626,6 @@ def on_focus_change(boss, window, data):
 
     if not result:
         return
-
-    destination_host = os.environ.get(
-        "TMUX2KITTY_DESTINATION_HOST",
-        "local",
-    )
-
-    ssh_opts_str = os.environ.get(
-        "TMUX2KITTY_SSHOPTS",
-        "",
-    )
 
     if destination_host == "local":
         cmd = [
@@ -723,7 +731,6 @@ while true; do
             tmux link-window -s '${SESSION}:${WINDOW_ID}' -t '${TAB_SESSION}:' 2>/dev/null || true
             tmux kill-window -t '${TAB_SESSION}:0' 2>/dev/null || true
             tmux set-option -t '${TAB_SESSION}' mouse off
-            tmux set-option -t '${TAB_SESSION}' alternate-screen off
             tmux set-option -t '${TAB_SESSION}' status off
             tmux set-option -t '${TAB_SESSION}' default-terminal 'xterm-256color'
             tmux set-option -ga terminal-overrides ',xterm*:smcup@:rmcup@'
@@ -813,6 +820,8 @@ main()
     # export variables to be used from the watcher script
     export TMUX2KITTY_DESTINATION_HOST=$DESTINATION_HOST
     export TMUX2KITTY_SSHOPTS="${SSH_OPTS[*]}"
+    export TMUX2KITTY_SESSION_REGEX="$SESSION_REGEX"
+    export TMUX2KITTY_TMUX_WINID_REGEX="$TMUX_WINID_REGEX"
 
     # Initialize SSH multiplexing control channel
     init_ssh_control
