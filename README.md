@@ -7,6 +7,8 @@ If you're looking for a terminal emulator that natively works with tmux or GNU S
 
 **tmux is the modern replacement for GNU Screen.** It keeps your terminal sessions, windows, and processes alive even when you disconnect. `tmux2kitty` lets Kitty display those tmux windows as **native Kitty tabs**, so you get the persistence of tmux without giving up Kitty's tab management.
 
+One approach is `tmux -CC` control mode, which lets a terminal emulator display tmux sessions as native tabs or windows. `tmux2kitty` takes a different approach, connecting to tmux separately and translating its windows into Kitty's native tabs, with seamless synchronization.
+
 It can:
 
 * Attach to an existing local or **remote tmux session** and recreate its windows as native Kitty tabs.
