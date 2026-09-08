@@ -9,16 +9,20 @@ set -u
 umask 0077
 
 SESSION=""
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/tmux-kitty}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/tmux-kitty"
 DESTINATION_HOST=""
 LOCAL=""
-
 WORKDIR=""
+CONNECTION_DIR=""
+
 
 # Kitty control socket
 KITTY_SOCKET=""
+
 # SSH multiplexing socket
 SSH_CONTROL="$HOME/.ssh/control-%C"
+SSH_CONTROL_PATH=""
+SSH_CONTROL_ID=""
 
 RECONNECT_DELAY=2
 POLL_INTERVAL=1
@@ -39,7 +43,7 @@ SSH_OPTS=(
 SESSION_REGEX='^[A-Za-z0-9_.-]{1,32}$'
 TMUX_WINID_REGEX='^@?[0-9]{1,6}$'
 TMUX_INDEX_REGEX='^[0-9]{1,6}$'
-TMUX_WINNAME_REGEX='^[^[:cntrl:]]{0,32}$'
+TMUX_WINNAME_REGEX='^[[:print:]]{0,32}$'
 
 
 
@@ -76,13 +80,13 @@ if [[ $# -eq 1 ]]; then
     destination_host="$1"
     session=""
 elif [[ $# -eq 3 ]]; then
-    destination_host="$1"
 
     if [[ "$2" != "-t" || -z "$3" ]]; then
         usage
         exit 1
     fi
 
+    destination_host="$1"
     session="$3"
     if [[ ! "$session" =~ $SESSION_REGEX ]]; then
 	echo "Invalid session name. Allowed characters: letters, numbers, underscores, dots, and hyphens. Maximum length is 32 bytes." >&2
@@ -95,16 +99,144 @@ else
 fi
 }
 
+validate_destination_host()
+{
+    local destination_host="$1"
+
+    [[ -n "$destination_host" ]] ||
+        do_exit 1 "missing SSH destination"
+
+    [[ "$destination_host" != -* ]] ||
+        do_exit 1 "SSH destination cannot begin with '-'"
+
+    [[ "$destination_host" == *[![:print:]]* ]] &&
+        do_exit 1 "SSH destination contains non-printable characters"
+}
+
+get_control_id()
+{
+local destination_host="$1"
+local -n ssh_control_path="$2"
+local -n ssh_control_id="$3"
+
+if [[ "${LOCAL:-0}" -eq 1 ]]; then
+    ssh_control_path="local"
+    ssh_control_id="local"
+    return 0
+fi
+
+
+ssh_control_path=$(ssh "${SSH_OPTS[@]}" -G -- "$DESTINATION_HOST" |
+    awk '$1 == "controlpath" { print $2; exit }') ||
+    do_exit 1 "unable to resolve SSH control path"
+
+ssh_control_id="${ssh_control_path##*/control-}"
+
+[[ "$ssh_control_id" =~ ^[[:xdigit:]]{20,50}$ ]] ||
+    do_exit 1 "unexpected SSH control identifier"
+
+}
+
 create_runtime_dir()
 {
-	local runtime_dir="$1"
-	# Per-session runtime directory
-	if ! mkdir -p -- "$runtime_dir"; then
-	    echo "ERROR: Failed to create runtime directory: $runtime_dir" >&2
-	    exit 1
-	fi
-	chmod 700 -- "$runtime_dir"
+    local runtime_dir="$1"
+    local uid owner mode
+
+    [[ -n "$runtime_dir" ]] ||
+        do_exit 1 "runtime directory is empty"
+
+    [[ "$runtime_dir" == /* ]] ||
+        do_exit 1 "runtime directory must be absolute: $runtime_dir"
+
+    uid=$(id -u) ||
+        do_exit 1 "unable to determine current UID"
+
+    # Never accept a symlink as the runtime directory.
+    [[ ! -L "$runtime_dir" ]] ||
+        do_exit 1 "runtime directory is a symlink: $runtime_dir"
+
+    mkdir -m 700 -- "$runtime_dir" 2>/dev/null
+
+    [[ -d "$runtime_dir" ]] ||
+        do_exit 1 "runtime path is not a directory: $runtime_dir"
+
+    owner=$(stat -c '%u' -- "$runtime_dir") ||
+        do_exit 1 "unable to inspect runtime directory: $runtime_dir"
+
+    [[ "$owner" == "$uid" ]] ||
+        do_exit 1 "runtime directory is not owned by current user: $runtime_dir"
+
+    mode=$(stat -c '%a' -- "$runtime_dir") ||
+        do_exit 1 "runtime directory has unsafe permissions: $runtime_dir"
+
+    [[ "$mode" == "700" ]] ||
+        do_exit 1 "runtime directory must have mode 700: $runtime_dir"
 }
+
+
+create_connection_dir()
+{
+    local connection_dir="$1"
+    local marker_file
+    local expected_marker="tmux-kitty-connection-v1"
+    local uid owner mode marker
+
+    [[ -n "$connection_dir" ]] ||
+        do_exit 1 "connection directory is empty"
+
+    [[ "$connection_dir" == /* ]] ||
+        do_exit 1 "connection directory must be absolute: $connection_dir"
+
+    uid=$(id -u) ||
+        do_exit 1 "unable to determine current UID"
+
+    marker_file="$connection_dir/.tmux-kitty-connection"
+
+    # Never follow a symlink.
+    [[ ! -L "$connection_dir" ]] ||
+        do_exit 1 "connection directory is a symlink: $connection_dir"
+
+    if [[ -e "$connection_dir" ]]; then
+        [[ -d "$connection_dir" ]] ||
+            do_exit 1 "connection path is not a directory: $connection_dir"
+
+        owner=$(stat -c '%u' -- "$connection_dir") ||
+            do_exit 1 "unable to inspect connection directory: $connection_dir"
+
+        [[ "$owner" == "$uid" ]] ||
+            do_exit 1 "connection directory is not owned by current user: $connection_dir"
+
+        mode=$(stat -c '%a' -- "$connection_dir") ||
+            do_exit 1 "connection directory has unsafe permissions: $connection_dir"
+
+        [[ "$mode" == "700" ]] ||
+            do_exit 1 "connection directory must have mode 700: $connection_dir"
+
+        [[ -f "$marker_file" ]] ||
+            do_exit 1 "connection directory is not a tmux-kitty directory: $connection_dir"
+
+        marker=$(<"$marker_file") ||
+            do_exit 1 "unable to read connection directory marker"
+
+        [[ "$marker" == "$expected_marker" ]] ||
+            do_exit 1 "invalid connection directory marker: $connection_dir"
+
+        # This is our own stale state, so it is safe to reset.
+        rm -rf -- "$connection_dir" ||
+            do_exit 1 "failed to remove stale connection directory: $connection_dir"
+    fi
+
+    mkdir -m 700 -- "$connection_dir" ||
+        do_exit 1 "failed to create connection directory: $connection_dir"
+
+    printf '%s\n' "$expected_marker" > "$marker_file" ||
+        do_exit 1 "failed to create connection directory marker"
+
+    chmod 600 -- "$marker_file" ||
+        do_exit 1 "failed to secure connection directory marker"
+}
+
+
 
 
 
@@ -134,10 +266,10 @@ check_ssh_socket()
 	[ "${LOCAL:-0}" -eq 1 ] && return 0
 
 	local ssh_host="$1"
-	local socket_path=$(ssh ${SSH_OPTS[@]} -G "$ssh_host" | awk '/^controlpath / {print $2}')
+	local socket_path=$(ssh "${SSH_OPTS[@]}" -G -- "$ssh_host" | awk '/^controlpath / {print $2}')
 
 	# Check if the file exists AND the connection test fails
-	if [ -S "$socket_path" ] && ! ssh "${SSH_OPTS[@]}" -O check "$ssh_host" 2>/dev/null; then
+	if [ -S "$socket_path" ] && ! ssh "${SSH_OPTS[@]}" -O check -- "$ssh_host" 2>/dev/null; then
 	    echo "⚠️ Stale SSH session detected! Fixing..."
 	    rm -f -- "$socket_path"
 	fi
@@ -181,14 +313,19 @@ init_ssh_control()
     done
 }
 
-ssh_remote()
+
+ssh_remote_bash()
 {
-    if [ "${LOCAL:-0}" -eq 1 ]; then
-	eval "$1"
+    local script="$1"
+    shift
+
+    if [[ "$LOCAL" -eq 1 ]]; then
+        bash -s -- "$@" <<< "$script"
     else
-        ssh "${SSH_OPTS[@]}" "$DESTINATION_HOST" -- "$1"
+        ssh "${SSH_OPTS[@]}" -- "$DESTINATION_HOST" bash -s -- "$@" <<< "$script"
     fi
 }
+
 
 
 # ============================================================
@@ -197,22 +334,40 @@ ssh_remote()
 
 tmux_all_session_list()
 {
-    local remote="$1"
+    local session_regex="$SESSION_REGEX"
     echo "=========================================="
     echo " TMUX REMOTE GUI LAUNCHER"
     echo "=========================================="
-    
+
     echo "Active remote sessions on $DESTINATION_HOST:"
-    if ! ssh_remote "tmux ls" >/dev/null 2>&1; then
+
+    mapfile -t sessions < <(
+        ssh_remote_bash 'tmux list-sessions -F "#{session_name}" 2>/dev/null'
+    )
+
+    if ((${#sessions[@]} == 0)); then
         echo "  (No active tmux sessions found)"
-    else
-        ssh_remote "tmux list-sessions -F '#{session_name}'" | grep -v '__' | while read -r s; do
-            echo "  📦 Session: $s"
-            ssh_remote "tmux list-windows -t '$s' -F '     ↳ Index #{window_index}: #{window_name}'" 2>/dev/null
-        done
+        echo "------------------------------------------"
+        return
     fi
+
+    for s in "${sessions[@]}"; do
+        [[ "$s" != *__* ]] || continue
+        [[ "$s" =~ $session_regex ]] || continue
+
+        echo "  📦 Session: $s"
+
+        ssh_remote_bash '
+          tmux list-windows \
+            -t "=$1" \
+            -F "     >> Index #{window_index}: #{window_name}" \
+            2>/dev/null' $s
+    done
+
     echo "------------------------------------------"
 }
+
+
 
 input_session_name()
 {
@@ -243,15 +398,14 @@ input_session_name()
 	    
 tmux_select_or_create_session()
 {
-    local session="$1"
-    if ! ssh_remote "tmux has-session -t '=${session}'" >/dev/null 2>&1; then
-        echo "Session '$session' does not exist. Creating it now..."
-        ssh_remote "tmux new-session -d -s '${session}'"
-        sleep 1
-    else
-        echo "Connecting to existing session: $session"
-    fi
-    echo
+	local session="$1"
+	if ! ssh_remote_bash 'tmux has-session -t "=$1" >/dev/null 2>&1' $session; then
+	    echo "Session '$session' does not exist. Creating it now..."
+	    ssh_remote_bash 'tmux new-session -d -s "$1"' $session
+	else
+	    echo "Connecting to existing session: $session"
+	fi
+	echo
 }
 
 
@@ -268,7 +422,7 @@ init_kitty()
 
     echo "Starting Kitty terminal..."
     kitty \
-        -o allow_remote_control=yes \
+        -o allow_remote_control=socket-only \
         -o remember_window_size=no \
         -o initial_window_width=100c \
         -o initial_window_height=24c \
@@ -320,7 +474,7 @@ kitty_create_tab()
                         --type=tab \
                         --tab-title "$index-$name" \
                         --title "$index-$name" \
-                        bash -c "printf '\033]2;%s\007' '$index'; exec '$runner' '$remote' '$session' '$window_id'" \
+                        "$runner" "$remote" "$session" "$window_id" \
                         >/dev/null
 
                     KNOWN_WINDOWS[$WINDOW_ID]=1
@@ -332,16 +486,18 @@ kitty_sync_tab_title()
     local window_ref="$1"
     local index="$2"
     local name="$3"
+    local session="$4"
 
+    local ref
     local clean_ref
+
     local tab_id
     local expected_title
     local current_title
 
-    
-    # Remove leading '@' if it exists (e.g., turn "@0" into "0")
     clean_ref="${window_ref#@}"
 
+    
     # 1. Determine the expected title
     if [ -n "$name" ]; then
         expected_title="${index}-${name}"
@@ -349,12 +505,15 @@ kitty_sync_tab_title()
         expected_title="${index}"
     fi
 
+
+    ref="${session}___${clean_ref}"
+    
     # 2. Find the actual Kitty Tab ID by searching for the reference in the cmdline
-    # This checks if any command-line argument matches the reference (with or without '@')
-    tab_id=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$clean_ref" '
-        .[].tabs[] 
-        | select(.windows[].cmdline[]? | . == $ref or . == "@" + $clean_ref) 
-        | .id
+    tab_id=$(kitty_cmd ls | jq -r --arg ref "$ref" '
+      .[] |
+      .tabs[].windows[] |
+      select(.cmdline[] == $ref) |
+      .id
     ' | head -n 1)
 
     # 3. If a valid Tab ID was found, check and update its title
@@ -371,14 +530,19 @@ kitty_sync_tab_title()
 switch_tab()
 {
     local window_ref="$1"
+    local session="$2"
     local clean_ref="${window_ref#@}"
+    local tab_id
 
-    tab_id=$(kitty_cmd ls | jq -r --arg ref "$window_ref" --arg clean_ref "$clean_ref" '
-        .[].tabs[] 
-        | select(.windows[].cmdline[]? | . == $ref or . == "@" + $clean_ref) 
-        | .id
+    local ref="${session}___${clean_ref}"
+
+    tab_id=$(kitty_cmd ls | jq -r --arg ref "$ref" '
+      .[] |
+      .tabs[].windows[] |
+      select(.cmdline[] == $ref) |
+      .id
     ' | head -n 1)
- 
+
     if [ -n "$tab_id" ]; then
             kitty_cmd focus-tab --match "id:$tab_id"
     fi
@@ -605,24 +769,39 @@ def on_focus_change(boss, window, data):
     if destination_host is None:
         raise RuntimeError("TMUX2KITTY_DESTINATION_HOST environment variable is not set")
 
-    ssh_opts_str = os.getenv("TMUX2KITTY_SSHOPTS")
-    if ssh_opts_str is None:
-        raise RuntimeError("TMUX2KITTY_SSHOPTS environment variable is not set")
-
-
+    ssh_control = os.getenv("TMUX2KITTY_SSH_CONTROL")
+    if ssh_control is None:
+        raise RuntimeError("TMUX2KITTY_SSH_CONTROL environment variable is not set")
+    
+    ssh_control_master = os.getenv("TMUX2KITTY_SSH_CONTROL_MASTER")
+    if ssh_control_master is None:
+        raise RuntimeError("TMUX2KITTY_SSH_CONTROL_MASTER environment variable is not set")
+    
+    ssh_control_persist = os.getenv("TMUX2KITTY_SSH_CONTROL_PERSIST")
+    if ssh_control_persist is None:
+        raise RuntimeError("TMUX2KITTY_SSH_CONTROL_PERSIST environment variable is not set")
+    
+    ssh_opts = [
+        "-o", f"ControlMaster={ssh_control_master}",
+        "-o", f"ControlPath={ssh_control}",
+        "-o", f"ControlPersist={ssh_control_persist}",
+    ]
+    
 
     result = ""
     cmdline = window.child.cmdline
 
-    for i, arg in enumerate(cmdline):
+    arg = cmdline[-1]
+    parts = arg.rsplit("___", 1)
+    
+    if len(parts) == 2:
+        session_name, winid = parts
+    
         if (
-            i > 0
-            and re.fullmatch(tmux_winid_regex, arg)
-            and re.fullmatch(session_regex, cmdline[i - 1]
-            )
+            re.fullmatch(session_regex, session_name)
+            and re.fullmatch(tmux_winid_regex, winid)
         ):
-            result = f"{cmdline[i - 1]}:{arg}"
-            break
+            result = f"{session_name}:@{winid}"
 
     if not result:
         return
@@ -635,8 +814,6 @@ def on_focus_change(boss, window, data):
             result,
         ]
     else:
-        ssh_opts = shlex.split(ssh_opts_str)
-
         cmd = [
             "ssh",
             *ssh_opts,
@@ -694,22 +871,62 @@ SSH_OPTS=(
     -o ConnectTimeout=10
 )
 
-ssh_remote()
+do_exit()
 {
-    if [ "${LOCAL:-0}" -eq 1 ]; then
-	eval "$1"
+        local exit_code="$1"
+
+        shift
+
+        echo "$@"
+        exit $exit_code
+}
+
+
+validate_destination_host()
+{
+    local destination_host="$1"
+
+    [[ -n "$destination_host" ]] ||
+        do_exit 1 "missing SSH destination"
+
+    [[ "$destination_host" != -* ]] ||
+        do_exit 1 "SSH destination cannot begin with '-'"
+
+    [[ "$destination_host" == *[![:print:]]* ]] &&
+        do_exit 1 "SSH destination contains non-printable characters"
+}
+
+ssh_remote_bash()
+{
+    local script="$1"
+    shift
+
+    if [[ "$LOCAL" -eq 1 ]]; then
+        bash -s -- "$@" <<< "$script"
     else
-        ssh "${SSH_OPTS[@]}" "$DESTINATION_HOST" -- "$1"
+        ssh "${SSH_OPTS[@]}" -- "$DESTINATION_HOST" bash -s -- "$@" <<< "$script"
+    fi
+}
+ssh_interactive_tmux()
+{
+    local tab_session="$1"
+
+    if [[ "$LOCAL" -eq 1 ]]; then
+        exec env TERM=xterm-256color \
+            tmux attach-session -t "$tab_session"
+    else
+        exec ssh "${SSH_OPTS[@]}" -t -- "$DESTINATION_HOST" \
+            env TERM=xterm-256color tmux attach-session -t "$tab_session"
     fi
 }
 
 ssh_master_alive()
 {
 [ "${LOCAL:-0}" -eq 1 ] && return 0
-    ssh "${SSH_OPTS[@]}" -O check "$DESTINATION_HOST" >/dev/null 2>&1
+    ssh "${SSH_OPTS[@]}" -O check -- "$DESTINATION_HOST" >/dev/null 2>&1
 }
 
-SAFE_WID=$(echo "$WINDOW_ID" | tr '@%' '_')
+SAFE_WID="${WINDOW_ID//@/_}"
 TAB_SESSION="${SESSION}__${SAFE_WID}"
 
 cleanup_tab() {
@@ -719,30 +936,42 @@ cleanup_tab() {
 }
 trap cleanup_tab EXIT
 
+validate_destination_host "$DESTINATION_HOST"
 while true; do
     while ! ssh_master_alive; do
         sleep "$RECONNECT_DELAY"
     done
 
     # Ensure an isolated session exists, link the window, disable mouse/alternate-screen, and set term-overrides
-	ssh_remote "
-	if ! tmux has-session -t '=${TAB_SESSION}' 2>/dev/null; then
-            tmux new-session -d -s '${TAB_SESSION}'
-            tmux link-window -s '${SESSION}:${WINDOW_ID}' -t '${TAB_SESSION}:' 2>/dev/null || true
-            tmux kill-window -t '${TAB_SESSION}:0' 2>/dev/null || true
-            tmux set-option -t '${TAB_SESSION}' mouse off
-            tmux set-option -t '${TAB_SESSION}' status off
-            tmux set-option -t '${TAB_SESSION}' default-terminal 'xterm-256color'
-            tmux set-option -ga terminal-overrides ',xterm*:smcup@:rmcup@'
-        fi" > /dev/null 2>&1
+ssh_remote_bash '
+	tab_session="$1"
+	session="$2"
+	window_id="$3"
 
-	SSH_OPTS+=(-t)
-	ssh_remote "TERM=xterm-256color tmux attach-session -t '${TAB_SESSION}'"
-	unset 'SSH_OPTS[-1]'
-	RET=$?
-	if [[ $RET -eq 0 ]]; then
-		exit 0
+	if ! tmux has-session -t "=$tab_session" 2>/dev/null; then
+	    tmux new-session -d -s "$tab_session"
+	    tmux link-window \
+		-s "$session:$window_id" \
+		-t "$tab_session:" \
+		2>/dev/null || true
+
+	    tmux kill-window \
+		-t "$tab_session:0" \
+		2>/dev/null || true
+
+	    tmux set-option -t "$tab_session" mouse off
+	    tmux set-option -t "$tab_session" status off
+	    tmux set-option -t "$tab_session" default-terminal "xterm-256color"
+	    tmux set-option -ga terminal-overrides ",xterm*:smcup@:rmcup@"
 	fi
+        ' "$TAB_SESSION" "$SESSION" "$WINDOW_ID" >/dev/null 2>&1
+
+ssh_interactive_tmux "$TAB_SESSION"
+RET=$?
+
+if [[ $RET -eq 0 ]]; then
+    exit 0
+fi
 
     sleep "$RECONNECT_DELAY"
 done
@@ -753,37 +982,61 @@ EOF
 
 tmux_purge_stale()
 {
-    local session="$1"
-    ssh_remote "tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${session}__' | xargs -r -I {} tmux kill-session -t '{}'" || true
+	local session="$1"
+
+	ssh_remote_bash '
+	set -u
+	session="$1"
+
+	tmux list-sessions -F "#{session_name}" 2>/dev/null |
+	while IFS= read -r s; do
+	    [[ "$s" == "${session}__"* ]] || continue
+	    tmux kill-session -t "$s"
+	done
+        ' $session
 }
 
 tmux_window_to_session()
 {
         local session="$1"
-        ssh_remote "
-            for s in \$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^${session}__'); do
-                [[ \"\$s\" =~ $SESSION_REGEX ]] || continue
-                for wid in \$(tmux list-windows -t \"\$s\" -F '#{window_id}' 2>/dev/null); do
-                    # Skip to the next window if the ID doesn't match the required format
-                    [[ \"\$wid\" =~ $TMUX_WINID_REGEX ]] || continue
-                    if ! tmux list-windows -t '=${session}' -F '#{window_id}' 2>/dev/null | grep -q \"\$wid\"; then
-                        tmux move-window -s \"\$s:\$wid\" -t '=${session}:' 2>/dev/null || true
-                    fi
-                done
-            done
-        " >/dev/null 2>&1
+        local session_regex_enc=$(printf '%s' "$SESSION_REGEX"  | base64 -w0)
+        local tmux_winid_regex_enc=$(printf '%s' "$TMUX_WINID_REGEX" | base64 -w0)
+	ssh_remote_bash '
+          session="$1"
+          session_regex=$(printf "%s" "$2" | base64 -d)
+          tmux_winid_regex=$(printf "%s" "$3" | base64 -d)
+          
+          while IFS= read -r s; do
+              [[ "$s" == "${session}__"* ]] || continue
+              [[ "$s" =~ $session_regex ]] || continue
+          
+              while IFS= read -r wid; do
+                  [[ "$wid" =~ $tmux_winid_regex ]] || continue
+          
+                  if ! tmux list-windows \
+                      -t "=$session" \
+                      -F "#{window_id}" 2>/dev/null |
+                      grep -q -F -- "$wid"; then
+                      tmux move-window \
+                          -s "$s:$wid" \
+                          -t "=$session:" \
+                          2>/dev/null || true
+                  fi
+              done < <(tmux list-windows -t "$s" -F "#{window_id}" 2>/dev/null)
+          done < <(tmux list-sessions -F "#{session_name}" 2>/dev/null)
+          ' "$session" "$session_regex_enc" "$tmux_winid_regex_enc"
+
 }
 
 tmux_window_list() {
 	local session="$1"
-	local window_list_command="tmux list-windows -t '=${session}' -F '#{window_id}|#{window_index}|#{window_name}'"
-	ssh_remote "$window_list_command" 2>/dev/null
+	ssh_remote_bash '
+		tmux list-windows -t "=$1" -F "#{window_id}|#{window_index}|#{window_name}" 2>/dev/null' $session
 }
 
 tmux_get_active_winid() {
 	local session="$1"
-	local get_activeid_command="tmux display-message -t '$session' -p '#{window_id}'"
-	ssh_remote "$get_activeid_command" 2>/dev/null
+	ssh_remote_bash 'tmux display-message -t "$1" -p "#{window_id}" 2>/dev/null' $session
 }
 
 
@@ -807,8 +1060,15 @@ main()
     # Before starting, create runtime directory
     # $DESTINATION_HOST and $SESSION update by reference
     #
-    check_param "DESTINATION_HOST" "SESSION" $@
-    create_runtime_dir $RUNTIME_DIR
+    check_param "DESTINATION_HOST" "SESSION" "$@"
+    # Check validity of DESTINATION_HOST
+    validate_destination_host "$DESTINATION_HOST"
+
+    #set proper LOCAL value
+    [[ "$DESTINATION_HOST" == "local" ]] && LOCAL=1 || LOCAL=0
+
+    create_runtime_dir "$RUNTIME_DIR"
+    get_control_id "$DESTINATION_HOST" "SSH_CONTROL_PATH" "SSH_CONTROL_ID"
 
     # Check local or remote session
     if [[ "$DESTINATION_HOST" == "local" ]]; then
@@ -819,7 +1079,9 @@ main()
 
     # export variables to be used from the watcher script
     export TMUX2KITTY_DESTINATION_HOST=$DESTINATION_HOST
-    export TMUX2KITTY_SSHOPTS="${SSH_OPTS[*]}"
+    export TMUX2KITTY_SSH_CONTROL="$SSH_CONTROL"
+    export TMUX2KITTY_SSH_CONTROL_MASTER="auto"
+    export TMUX2KITTY_SSH_CONTROL_PERSIST="10m"
     export TMUX2KITTY_SESSION_REGEX="$SESSION_REGEX"
     export TMUX2KITTY_TMUX_WINID_REGEX="$TMUX_WINID_REGEX"
 
@@ -827,7 +1089,7 @@ main()
     init_ssh_control
 
     # Present startup session menu
-    tmux_all_session_list $DESTINATION_HOST
+    tmux_all_session_list "$DESTINATION_HOST"
 
     # if command line do not have SESSION then ask
     # $SESSION update by reference
@@ -835,28 +1097,31 @@ main()
          input_session_name "SESSION"
     fi
 
-    SESSION_DIR="$RUNTIME_DIR/$SESSION"
+    CONNECTION_DIR="$RUNTIME_DIR/$SSH_CONTROL_ID"
+    create_connection_dir "$CONNECTION_DIR"
+    SESSION_DIR="$CONNECTION_DIR/$SESSION"
     WORKDIR="$SESSION_DIR/work"
     KITTY_SOCKET="$SESSION_DIR/kitty.sock"
+	mkdir -m 700 -- "$SESSION_DIR" ||
+	    do_exit 1 "failed to create session directory"
 
-    mkdir -p  -- "$SESSION_DIR"
-    rm    -rf -- "$WORKDIR"
-    mkdir -p  -- "$WORKDIR"
-    chmod 700 -- "$SESSION_DIR" "$WORKDIR"
+	mkdir -m 700 -- "$WORKDIR" ||
+	    do_exit 1 "failed to create work directory"
 
-    tmux_select_or_create_session $SESSION
+
+    tmux_select_or_create_session "$SESSION"
 
     # Purge stale remote tab sessions from previous runs for this session safely
     echo "Purging stale remote tab sessions..."
-    tmux_purge_stale $SESSION 
+    tmux_purge_stale "$SESSION"
 
     # Create tab runner script
     RUNNER="$WORKDIR/remote-tmux-tab.sh"
-    create_runner $RUNNER
+    create_runner "$RUNNER"
 
     # Create tab watcher script for updating active window to tmux
     TAB_WATCHER="$WORKDIR/tabwatcher.py"
-    create_tab_watcher $TAB_WATCHER
+    create_tab_watcher "$TAB_WATCHER"
 
     # Initialize local Kitty terminal instance
     # $KITTY_PID update by reference
@@ -873,10 +1138,14 @@ main()
     echo "Kitty  : $KITTY_PID"
     echo
 
-    local active_winid=$(tmux_get_active_winid $SESSION)
+    local active_winid
+    active_winid=$(tmux_get_active_winid "$SESSION")
 	
-    local first_run=1
-    local created_new_tab=0
+    local first_run
+    first_run=1
+
+    local created_new_tab
+    created_new_tab=0
 
     # Continuous monitoring loop
     while true; do
@@ -884,24 +1153,25 @@ main()
             do_exit 0 "Kitty socket not found, exiting normally..." 
         fi
         # Create a new session for each window
-        tmux_window_to_session $SESSION
+        tmux_window_to_session "$SESSION"
 
-        if mapfile -t WINDOWS < <(tmux_window_list $SESSION); then
+        if mapfile -t WINDOWS < <(tmux_window_list "$SESSION"); then
             declare -A CURRENT_ACTIVE_IDS
             for ENTRY in "${WINDOWS[@]}"; do
                 IFS='|' read -r WINDOW_ID INDEX NAME <<< "$ENTRY"
 
 		[[ "$WINDOW_ID" =~ $TMUX_WINID_REGEX   ]] || continue
 		[[ "$INDEX"     =~ $TMUX_INDEX_REGEX   ]] || continue
-		[[ "$NAME"      =~ $TMUX_WINNAME_REGEX ]] || continue
 
                 # Remove control characters from the strings eg. literal \r \n etc.
                 printf -v NAME '%b' "$NAME"
+                NAME="${NAME//[$'\u200b\u200c\u200d\u202e\u200f\u202a\u202b\u202c']}"
                 NAME="${NAME//[[:cntrl:]]}"
-
+                NAME="${NAME//|}"
+		[[ "$NAME"      =~ $TMUX_WINNAME_REGEX ]] || continue
                 CURRENT_ACTIVE_IDS[$WINDOW_ID]=1
 
-                kitty_sync_tab_title "$WINDOW_ID" "$INDEX" "$NAME"
+                kitty_sync_tab_title "$WINDOW_ID" "$INDEX" "$NAME" "$SESSION"
 
                 if [[ -z "${KNOWN_WINDOWS[$WINDOW_ID]:-}" ]]; then
                     echo "New window detected: $INDEX ($NAME - $WINDOW_ID). Creating dedicated tab..."
@@ -917,7 +1187,9 @@ main()
 
             if [ "$first_run" -eq 1 ]; then
                 if [ -n "$active_winid" ]; then
-                    switch_tab $active_winid
+                    # Wait for tabs to be initialized before switching to tmux active window
+                    sleep 1
+                    echo "$active_winid" "$SESSION"
                 fi
                 first_run=0
             fi
