@@ -9,7 +9,10 @@ set -u
 umask 0077
 
 SESSION=""
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/tmux-kitty"
+RUNTIME_NAME="tmux-kitty"
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-$HOME/.cache}"
+RUNTIME_DIR="${RUNTIME_BASE}/${RUNTIME_NAME}"
+
 DESTINATION_HOST=""
 LOCAL=""
 WORKDIR=""
@@ -137,107 +140,101 @@ ssh_control_id="${ssh_control_path##*/control-}"
 
 }
 
-create_runtime_dir()
-{
-    local runtime_dir="$1"
-    local uid owner mode
+random_number() {
+    local digits="$1"
+    local number
 
-    [[ -n "$runtime_dir" ]] ||
-        do_exit 1 "runtime directory is empty"
-
-    [[ "$runtime_dir" == /* ]] ||
-        do_exit 1 "runtime directory must be absolute: $runtime_dir"
-
-    uid=$(id -u) ||
-        do_exit 1 "unable to determine current UID"
-
-    # Never accept a symlink as the runtime directory.
-    [[ ! -L "$runtime_dir" ]] ||
-        do_exit 1 "runtime directory is a symlink: $runtime_dir"
-
-    mkdir -m 700 -- "$runtime_dir" 2>/dev/null
-
-    [[ -d "$runtime_dir" ]] ||
-        do_exit 1 "runtime path is not a directory: $runtime_dir"
-
-    owner=$(stat -c '%u' -- "$runtime_dir") ||
-        do_exit 1 "unable to inspect runtime directory: $runtime_dir"
-
-    [[ "$owner" == "$uid" ]] ||
-        do_exit 1 "runtime directory is not owned by current user: $runtime_dir"
-
-    mode=$(stat -c '%a' -- "$runtime_dir") ||
-        do_exit 1 "runtime directory has unsafe permissions: $runtime_dir"
-
-    [[ "$mode" == "700" ]] ||
-        do_exit 1 "runtime directory must have mode 700: $runtime_dir"
-}
-
-
-create_connection_dir()
-{
-    local connection_dir="$1"
-    local marker_file
-    local expected_marker="tmux-kitty-connection-v1"
-    local uid owner mode marker
-
-    [[ -n "$connection_dir" ]] ||
-        do_exit 1 "connection directory is empty"
-
-    [[ "$connection_dir" == /* ]] ||
-        do_exit 1 "connection directory must be absolute: $connection_dir"
-
-    uid=$(id -u) ||
-        do_exit 1 "unable to determine current UID"
-
-    marker_file="$connection_dir/.tmux-kitty-connection"
-
-    # Never follow a symlink.
-    [[ ! -L "$connection_dir" ]] ||
-        do_exit 1 "connection directory is a symlink: $connection_dir"
-
-    if [[ -e "$connection_dir" ]]; then
-        [[ -d "$connection_dir" ]] ||
-            do_exit 1 "connection path is not a directory: $connection_dir"
-
-        owner=$(stat -c '%u' -- "$connection_dir") ||
-            do_exit 1 "unable to inspect connection directory: $connection_dir"
-
-        [[ "$owner" == "$uid" ]] ||
-            do_exit 1 "connection directory is not owned by current user: $connection_dir"
-
-        mode=$(stat -c '%a' -- "$connection_dir") ||
-            do_exit 1 "connection directory has unsafe permissions: $connection_dir"
-
-        [[ "$mode" == "700" ]] ||
-            do_exit 1 "connection directory must have mode 700: $connection_dir"
-
-        [[ -f "$marker_file" ]] ||
-            do_exit 1 "connection directory is not a tmux-kitty directory: $connection_dir"
-
-        marker=$(<"$marker_file") ||
-            do_exit 1 "unable to read connection directory marker"
-
-        [[ "$marker" == "$expected_marker" ]] ||
-            do_exit 1 "invalid connection directory marker: $connection_dir"
-
-        # This is our own stale state, so it is safe to reset.
-        rm -rf -- "$connection_dir" ||
-            do_exit 1 "failed to remove stale connection directory: $connection_dir"
+    if [[ ! "$digits" =~ ^[1-9][0-9]*$ ]]; then
+        do_exit 1 "Wrong param. Usage: random_number <number_of_digits>"
     fi
 
-    mkdir -m 700 -- "$connection_dir" ||
-        do_exit 1 "failed to create connection directory: $connection_dir"
+    while true; do
+        number=$(LC_ALL=C tr -dc '0-9' < /dev/urandom | head -c "$digits")
 
-    printf '%s\n' "$expected_marker" > "$marker_file" ||
-        do_exit 1 "failed to create connection directory marker"
-
-    chmod 600 -- "$marker_file" ||
-        do_exit 1 "failed to secure connection directory marker"
+        [[ "${number:0:1}" != "0" ]] && {
+            printf '%s\n' "$number"
+            return 0
+        }
+    done
 }
 
+ensure_dir()
+{
+    local dir="$1"
+    local expected_mode="$2"
+    local uid owner mode
 
+    [[ -n "$dir" ]] ||
+        do_exit 1 "directory path is empty"
 
+    [[ "$dir" == /* ]] ||
+        do_exit 1 "directory path must be absolute: $dir"
+
+    [[ "$expected_mode" =~ ^[0-7]{3,4}$ ]] ||
+        do_exit 1 "invalid directory mode: $expected_mode"
+
+    uid=$(id -u) ||
+        do_exit 1 "unable to determine current UID"
+
+    # Try to create it first. mkdir is atomic for the final component.
+    if mkdir --mode="$expected_mode" -- "$dir" 2>/dev/null; then
+        # Explicitly enforce the final mode.
+        chmod "$expected_mode" -- "$dir" ||
+            do_exit 1 "failed to set directory mode: $dir"
+
+        return 0
+    fi
+
+    # Something already exists at this path.
+    # A symlink is never acceptable.
+    [[ ! -L "$dir" ]] ||
+        do_exit 1 "directory is a symlink: $dir"
+
+    [[ -d "$dir" ]] ||
+        do_exit 1 "path exists but is not a directory: $dir"
+
+    owner=$(stat -c '%u' -- "$dir") ||
+        do_exit 1 "unable to inspect directory owner: $dir"
+
+    [[ "$owner" == "$uid" ]] ||
+        do_exit 1 "directory is not owned by current user: $dir"
+
+    mode=$(stat -c '%a' -- "$dir") ||
+        do_exit 1 "unable to inspect directory permissions: $dir"
+
+    [[ "$mode" == "$expected_mode" ]] ||
+        do_exit 1 \
+            "directory has mode $mode, expected $expected_mode: $dir"
+
+    return 0
+}
+
+safe_create_dir()
+{
+    local parent_dir="$1"
+    local name="$2"
+    local dir="$parent_dir/$name"
+
+    [[ -n "$parent_dir" ]] ||
+        do_exit 1 "parent directory is empty"
+
+    [[ "$parent_dir" == /* ]] ||
+        do_exit 1 "parent directory must be absolute: $parent_dir"
+
+    [[ -n "$name" ]] ||
+        do_exit 1 "directory name is empty"
+
+    # Deliberately allow only a simple path component.
+    [[ "$name" != */* && "$name" != "." && "$name" != ".." ]] ||
+        do_exit 1 "invalid directory name: $name"
+
+    # Create exactly this directory, never an existing one.
+    mkdir --mode=700 -- "$dir" ||
+        do_exit 1 "failed to create directory: $dir"
+
+    chmod 700 -- "$dir" ||
+        do_exit 1 "failed to secure directory: $dir"
+}
 
 
 
@@ -817,6 +814,7 @@ def on_focus_change(boss, window, data):
         cmd = [
             "ssh",
             *ssh_opts,
+            "--",
             destination_host,
             "tmux",
             "select-window",
@@ -1067,7 +1065,10 @@ main()
     #set proper LOCAL value
     [[ "$DESTINATION_HOST" == "local" ]] && LOCAL=1 || LOCAL=0
 
-    create_runtime_dir "$RUNTIME_DIR"
+    ensure_dir "$RUNTIME_DIR" 700 ||
+        do_exit 1 "failed to create validate RUNTIME directory: $RUNTIME_DIR"
+
+
     get_control_id "$DESTINATION_HOST" "SSH_CONTROL_PATH" "SSH_CONTROL_ID"
 
     # Check local or remote session
@@ -1097,8 +1098,10 @@ main()
          input_session_name "SESSION"
     fi
 
-    CONNECTION_DIR="$RUNTIME_DIR/$SSH_CONTROL_ID"
-    create_connection_dir "$CONNECTION_DIR"
+    local runtime_current_session=$(random_number 10)
+    safe_create_dir "$RUNTIME_DIR" "$runtime_current_session" || 
+        do_exit 1 "failed to create create RUNTIME directory: $RUNTIME_DIR/$runtime_current_session"
+    CONNECTION_DIR="$RUNTIME_DIR/$runtime_current_session"
     SESSION_DIR="$CONNECTION_DIR/$SESSION"
     WORKDIR="$SESSION_DIR/work"
     KITTY_SOCKET="$SESSION_DIR/kitty.sock"
@@ -1189,7 +1192,7 @@ main()
                 if [ -n "$active_winid" ]; then
                     # Wait for tabs to be initialized before switching to tmux active window
                     sleep 1
-                    echo "$active_winid" "$SESSION"
+                    switch_tab "$active_winid" "$SESSION"
                 fi
                 first_run=0
             fi
