@@ -105,6 +105,7 @@ Add the keybindings provided in the `kitty.conf` file to your `~/.config/kitty/k
 
 - **`Ctrl + Left_arrow`** / **`Ctrl + Right_arrow`**: Previous / next tab
 - **`Ctrl + 0`** through **`Ctrl + 9`**: Go directly to a specific tab index
+- **`Ctrl + Shift + D`**: Detach/close the current session, similar to tmux detach
 
 ---------
 
