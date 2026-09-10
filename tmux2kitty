@@ -398,7 +398,9 @@ tmux_select_or_create_session()
 	local session="$1"
 	if ! ssh_remote_bash 'tmux has-session -t "=$1" >/dev/null 2>&1' $session; then
 	    echo "Session '$session' does not exist. Creating it now..."
-	    ssh_remote_bash 'tmux new-session -d -s "$1"' $session
+	    ssh_remote_bash 'tmux -f /dev/null start-server \
+                             \; set-option -g default-terminal xterm-256color \
+                             \; new-session -d -s "$1" ' $session
 	else
 	    echo "Connecting to existing session: $session"
 	fi
@@ -424,10 +426,7 @@ init_kitty()
         -o initial_window_width=100c \
         -o initial_window_height=24c \
         -o scrollback_pager="less --chop-long-lines --RAW-CONTROL-CHARS +INPUT_LINE_NUMBER" \
-        -o mouse_map="wheel_up ungrabbed scroll_line_up" \
-        -o mouse_map="wheel_down ungrabbed scroll_line_down" \
         -o tab_title_template="{title}" \
-        -o dynamic_title=yes \
         --watcher "${tab_watcher}" \
         --listen-on "unix:${kitty_socket}" &
 
@@ -959,6 +958,7 @@ ssh_remote_bash '
 
 	    tmux set-option -t "$tab_session" mouse off
 	    tmux set-option -t "$tab_session" status off
+	    tmux set-option -t "$tab_session" history-limit 10000
 	    tmux set-option -t "$tab_session" default-terminal "xterm-256color"
 	    tmux set-option -ga terminal-overrides ",xterm*:smcup@:rmcup@"
 	fi
