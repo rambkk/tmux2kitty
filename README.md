@@ -98,14 +98,21 @@ Run the script by specifying either a remote SSH host or `local`, optionally fol
    ```
 
 ---------
+## Keybindings
 
-## Keybindings (Optional Kitty Integration)
+Add the keybindings from kitty.conf to ~/.config/kitty/kitty.conf.
 
-Add the keybindings provided in the `kitty.conf` file to your `~/.config/kitty/kitty.conf` to switch between your synchronized tabs instantly:
+### Scrollback
 
-- **`Ctrl + Left_arrow`** / **`Ctrl + Right_arrow`**: Previous / next tab
-- **`Ctrl + 0`** through **`Ctrl + 9`**: Go directly to a specific tab index
-- **`Ctrl + Shift + D`**: Detach/close the current session, similar to tmux detach
+- Ctrl + Up: View the current tmux pane's scrollback
+- Up/Down: Scroll line by line · Page Up/Page Down: Scroll by page
+- Esc/q: Exit scrollback
+
+### Navigation
+
+- Ctrl + Left/Right: Previous / next tab
+- Ctrl + 0–9: Jump to tab index
+- Ctrl + Shift + D: Detach / close the current session
 
 ---------
 
