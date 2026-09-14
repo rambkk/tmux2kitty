@@ -420,7 +420,7 @@ init_kitty()
     rm -f -- "$kitty_socket"
 
     echo "Starting Kitty terminal..."
-    kitty \
+    TMUX2KITTY_SCROLLER_SCRIPT="$WORKDIR/launch_scroller.sh" kitty \
         -o allow_remote_control=socket-only \
         -o remember_window_size=no \
         -o initial_window_width=100c \
@@ -839,6 +839,154 @@ def on_title_change(boss, window, data):
 EOF
 }
 
+create_launch_scroller()
+{
+    local launch_scroller="$1"
+    cat > "$launch_scroller" <<'EOF'
+#!/usr/bin/bash
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCROLLER_SCRIPT="$SCRIPT_DIR/scroller.sh"
+
+exec kitty @ launch \
+    --type=overlay \
+    --var "overlay=1" \
+    env TMUX2KITTY_OVERLAY_STATE=1 \
+    $SCROLLER_SCRIPT
+
+EOF
+
+    chmod +x "$launch_scroller"
+}
+
+
+create_scroller()
+{
+    local scroller_script="$1"
+    cat > "$scroller_script" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+SSH_OPTS=(
+	-o ControlMaster="${TMUX2KITTY_SSH_CONTROL_MASTER}" 
+        -o ControlPath="${TMUX2KITTY_SSH_CONTROL}"
+        -o ControlPersist="${TMUX2KITTY_SSH_CONTROL_PERSIST}"
+)
+
+ssh_remote_bash()
+{   
+    local script="$1"
+    shift
+
+    if [[ "${LOCAL:-0}" -eq 1 ]]; then
+        bash -s -- "$@" <<< "$script"
+    else
+        ssh "${SSH_OPTS[@]}" -- "$DESTINATION_HOST" bash -s -- "$@" <<< "$script"
+    fi 
+} 
+
+validate_destination_host()
+{   
+    local destination_host="$1"
+    
+    [[ -n "$destination_host" ]] ||
+        do_exit 1 "missing SSH destination"
+    
+    [[ "$destination_host" != -* ]] ||
+        do_exit 1 "SSH destination cannot begin with '-'"
+    
+    [[ "$destination_host" == *[![:print:]]* ]] &&
+        do_exit 1 "SSH destination contains non-printable characters"
+
+    return 0
+}
+
+do_exit()
+{
+        local exit_code="$1"
+        
+        shift
+
+        echo "error: $@" 
+        exit $exit_code
+}   
+
+print_help() {
+    local text='  ← ↑ ↓ → PgUp PgDn • Scroll │ Esc / q • Exit '
+    local cols
+    cols=$(tput cols)
+
+    printf '\e[48;2;35;55;85m\e[38;2;255;255;255m'
+    printf '%-*s' "$cols" "$text"
+    printf '\e[0m'
+}
+
+KITTY_SOCKET="$KITTY_LISTEN_ON"
+DESTINATION_HOST=""
+SESSION=""
+TMUX_WINID=""
+
+read -r DESTINATION_HOST SESSION TMUX_WINID < <(kitty @ ls --to "$KITTY_SOCKET" | 
+jq -r '
+  .[].tabs[] |
+  select(.is_active == true) |
+  .windows[] |
+  select(.cmdline[-1] // "" | contains("___")) |
+  (.cmdline | index("--")) as $i |
+  .cmdline[-1] as $name |
+  "\(
+    if $i == null then "local"
+    else .cmdline[$i + 1]
+    end
+  ) \($name[0:$name | rindex("___")]) \($name[($name | rindex("___")) + 3:])"
+'
+)
+
+[[ "$DESTINATION_HOST" == "$TMUX2KITTY_DESTINATION_HOST" ]] || do_exit 1 "destination host could not be verified"
+validate_destination_host "$DESTINATION_HOST"
+[[ "$SESSION" =~ $TMUX2KITTY_SESSION_REGEX ]] || do_exit 1 "Invalid session: $SESSION"
+[[ "$TMUX_WINID" =~ $TMUX2KITTY_TMUX_WINID_REGEX ]] || do_exit 1 "Invalid window ID: $TMUX_WINID"
+
+[[ "$DESTINATION_HOST" == "local" ]] && LOCAL=1 || LOCAL=0
+
+
+# Get tmux scroll content
+output=$(ssh_remote_bash 'tmux capture-pane -p -t "$1":@"$2".0 -S -' $SESSION $TMUX_WINID)
+
+# Display the result
+printf '%s\n' "$output"
+print_help
+
+
+while true; do
+    IFS= read -rsn1 key
+
+    # q exits immediately
+    [[ "$key" == "q" ]] && exit 0
+
+    # Handle Escape / escape sequences
+    if [[ "$key" == $'\e' ]]; then
+        # Arrow keys etc. start with ESC, so check for more bytes.
+        if IFS= read -rsn1 -t 0.05 next; then
+            # Consume the rest of the escape sequence
+            while IFS= read -rsn1 -t 0.001 next; do
+                :
+            done
+        else
+            # Standalone Esc
+            exit 0
+        fi
+    fi
+done
+
+EOF
+
+    chmod +x "$scroller_script"
+}
+
+
+
+
 create_runner()
 {
     local runner="$1"
@@ -874,7 +1022,7 @@ do_exit()
 
         shift
 
-        echo "$@"
+        echo "error: $@" >&2
         exit $exit_code
 }
 
@@ -1079,7 +1227,7 @@ main()
     fi
 
     # export variables to be used from the watcher script
-    export TMUX2KITTY_DESTINATION_HOST=$DESTINATION_HOST
+    export TMUX2KITTY_DESTINATION_HOST="$DESTINATION_HOST"
     export TMUX2KITTY_SSH_CONTROL="$SSH_CONTROL"
     export TMUX2KITTY_SSH_CONTROL_MASTER="auto"
     export TMUX2KITTY_SSH_CONTROL_PERSIST="10m"
@@ -1111,7 +1259,6 @@ main()
 	mkdir -m 700 -- "$WORKDIR" ||
 	    do_exit 1 "failed to create work directory"
 
-
     tmux_select_or_create_session "$SESSION"
 
     # Purge stale remote tab sessions from previous runs for this session safely
@@ -1123,8 +1270,14 @@ main()
     create_runner "$RUNNER"
 
     # Create tab watcher script for updating active window to tmux
-    TAB_WATCHER="$WORKDIR/tabwatcher.py"
+    TAB_WATCHER="$WORKDIR/tYabwatcher.py"
     create_tab_watcher "$TAB_WATCHER"
+
+    # Create scroller launcher and scroller
+    LAUNCH_SCROLLER="$WORKDIR/launch_scroller.sh"
+    create_launch_scroller "$LAUNCH_SCROLLER"
+    SCROLLER_SCRIPT="$WORKDIR/scroller.sh"
+    create_scroller "$SCROLLER_SCRIPT"
 
     # Initialize local Kitty terminal instance
     # $KITTY_PID update by reference
