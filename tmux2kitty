@@ -498,7 +498,7 @@ kitty_sync_tab_title()
     if [ -n "$name" ]; then
         expected_title="${index}-${name}"
     else
-        expected_title="${index}"
+        expected_title="${index}-"
     fi
 
 
